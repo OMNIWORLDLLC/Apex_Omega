@@ -98,7 +98,7 @@ export function calculateSpread(
   poolA: Pool,
   poolB: Pool,
   amountIn: bigint,
-  flashloanFeeBps: number = 5,
+  flashloanFeeBps: number = 5,   // Aave V3 flashloan fee: 5 bps = 0.05%
   gasCostTokenUnits: bigint = 0n,
   bribeTokenUnits: bigint = 0n,
 ): SpreadResult | null {

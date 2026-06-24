@@ -296,8 +296,19 @@ export class MevRouteDiscoveryEngine {
     return pairs.slice(0, limit);
   }
 
+  /** Swap tokenIn/tokenOut fields to build the reverse exploration pair. */
+  private reverseTokenPair(pair: TokenPair): TokenPair {
+    return {
+      tokenIn: pair.tokenOut,
+      tokenOut: pair.tokenIn,
+      tokenInSymbol: pair.tokenOutSymbol,
+      tokenOutSymbol: pair.tokenInSymbol,
+      tokenInDecimals: pair.tokenOutDecimals,
+      tokenOutDecimals: pair.tokenInDecimals,
+    };
+  }
+
   /**
-   * Compute a complete triangular arbitrage route.
    * Both swap directions are evaluated for every venue pair:
    *   - Direction AB: tokenIn → tokenOut (Leg 1), tokenOut → tokenIn (Leg 2)
    *   - Direction BA: tokenOut → tokenIn (Leg 1), tokenIn → tokenOut (Leg 2)
@@ -359,14 +370,7 @@ export class MevRouteDiscoveryEngine {
 
         // ---- Direction BA: tokenOut → tokenIn → tokenOut ----
         try {
-          const reversePair: TokenPair = {
-            tokenIn: pair.tokenOut,
-            tokenOut: pair.tokenIn,
-            tokenInSymbol: pair.tokenOutSymbol,
-            tokenOutSymbol: pair.tokenInSymbol,
-            tokenInDecimals: pair.tokenOutDecimals,
-            tokenOutDecimals: pair.tokenInDecimals,
-          };
+          const reversePair = this.reverseTokenPair(pair);
           const leg1BA = this.estimateSwapPrice(
             pair.tokenOut,
             pair.tokenIn,
@@ -520,6 +524,8 @@ export class MevRouteDiscoveryEngine {
     // YIELD INVARIANT (full, including gas): net profit in USD must exceed gas cost.
     // netProfitUSD subtracts gasCostUSD so that only routes with strictly positive
     // profit after ALL costs (swap fees + flashloan fee + gas) are marked executable.
+    // Math.max(0, ...) clamps the value to zero for routes where gas exceeds token
+    // profit; these routes will fail the minProfitUSD threshold check below.
     const netProfitUSD = Math.max(0, netProfit * context.maticPriceUSD - gasCostUSD);
 
     let executabilityReason: string | undefined;
