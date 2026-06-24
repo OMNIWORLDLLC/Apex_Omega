@@ -1290,9 +1290,19 @@ async function startServer() {
         });
       }
 
+      // Validate that context.steps is a non-empty array before locking so the
+      // key is deterministic and cannot collapse to a generic asset-only key.
+      if (!Array.isArray(context?.steps) || context.steps.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: "INVALID_C1_PAYLOAD: context.steps must be a non-empty array.",
+          payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
+        });
+      }
+
       // ── Redis: acquire route lock before broadcast ──────────────────────
       const { acquired: c1LockAcquired, key: c1RouteKey } =
-        await redisGuard.acquireC1Lock(flashloanAsset, context?.steps || []);
+        await redisGuard.acquireC1Lock(flashloanAsset, context.steps);
       if (!c1LockAcquired) {
         return res.status(409).json({
           success: false,
@@ -2846,8 +2856,21 @@ async function startServer() {
   // ── Graceful shutdown: close Redis connection cleanly ───────────────────
   const shutdown = async (signal: string) => {
     console.log(`[APEX_OMEGA] ${signal} received – shutting down`);
-    await redisGuard.close();
-    server.close(() => process.exit(0));
+    const shutdownTimeout = setTimeout(() => {
+      console.error("[APEX_OMEGA] Shutdown timed out – forcing exit");
+      process.exit(1);
+    }, 10_000);
+    shutdownTimeout.unref();
+    try {
+      await redisGuard.close();
+    } catch (err: any) {
+      console.warn("[APEX_OMEGA] Redis close error during shutdown:", err?.message);
+    }
+    server.close((err) => {
+      if (err) console.error("[APEX_OMEGA] HTTP server close error:", err.message);
+      clearTimeout(shutdownTimeout);
+      process.exit(err ? 1 : 0);
+    });
   };
   process.once("SIGTERM", () => shutdown("SIGTERM"));
   process.once("SIGINT", () => shutdown("SIGINT"));

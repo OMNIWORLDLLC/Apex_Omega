@@ -461,23 +461,23 @@ export default class SystemBootstrap {
           minProfitUSD
         );
 
+        // Helper: build the Redis key for an ArbitrageRoute
+        const routeKey = (r: ArbitrageRoute) =>
+          routeKeyFromArbitrageRoute({
+            tokenIn: r.tokenIn,
+            tokenOut: r.tokenOut,
+            legs: r.legs.map((l) => ({
+              venue: l.venueId,
+              tokenIn: l.tokenIn,
+              tokenOut: l.tokenOut,
+            })),
+          });
+
         // ── Redis: filter out routes already claimed by another worker ──────
         let eligibleRoutes = discoveredRoutes;
         if (this.routeGuard) {
           const lockChecks = await Promise.all(
-            discoveredRoutes.map((r) =>
-              this.routeGuard!.isLocked(
-                routeKeyFromArbitrageRoute({
-                  tokenIn: r.tokenIn,
-                  tokenOut: r.tokenOut,
-                  legs: r.legs.map((l) => ({
-                    venue: l.venueId,
-                    tokenIn: l.tokenIn,
-                    tokenOut: l.tokenOut,
-                  })),
-                })
-              )
-            )
+            discoveredRoutes.map((r) => this.routeGuard!.isLocked(routeKey(r)))
           );
           eligibleRoutes = discoveredRoutes.filter((_, idx) => !lockChecks[idx]);
         }
@@ -485,16 +485,7 @@ export default class SystemBootstrap {
         // ── Select best unlocked route and acquire its lock ─────────────────
         const selectedRoute = eligibleRoutes[0] ?? null;
         if (selectedRoute && this.routeGuard) {
-          const key = routeKeyFromArbitrageRoute({
-            tokenIn: selectedRoute.tokenIn,
-            tokenOut: selectedRoute.tokenOut,
-            legs: selectedRoute.legs.map((l) => ({
-              venue: l.venueId,
-              tokenIn: l.tokenIn,
-              tokenOut: l.tokenOut,
-            })),
-          });
-          const acquired = await this.routeGuard.tryAcquireLock(key);
+          const acquired = await this.routeGuard.tryAcquireLock(routeKey(selectedRoute));
           if (!acquired) {
             // Another worker claimed this route between the isLocked check and
             // tryAcquireLock. Treat the cycle as no-route rather than racing.

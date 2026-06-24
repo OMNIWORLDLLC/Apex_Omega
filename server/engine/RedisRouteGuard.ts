@@ -165,7 +165,13 @@ export class RedisRouteGuard {
   ): Promise<boolean> {
     if (this.noop || !this.redis) return true;
     try {
-      const result = await this.redis.set(key, "1", "EX", ttlSeconds, "NX");
+      const result = await this.redis.set(
+        key,
+        "1", // value is arbitrary; lock semantics rely on key existence only
+        "EX",
+        ttlSeconds,
+        "NX"
+      );
       return result === "OK";
     } catch (err: any) {
       console.warn(
