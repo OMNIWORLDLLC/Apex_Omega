@@ -116,6 +116,7 @@ The following tests were run locally against the current runtime configuration u
 | Route adapter/source verification | PASS | 43.653s | All six adapter classes reported `routeEligible=true`; recent discovery log probes succeeded. |
 | Cloud readiness | PASS | 4.706s | `CLOUD_READINESS|status=PASS`; target code, owners, signer, Aave pool, liquidation target checked. |
 | Full dynamic live-cycle under runtime config | TIMEOUT | 301.727s | `npm run live:cycle` did not emit a route table before timeout. |
+| Performance metrics (profitability/latency/coverage) | — | — | `npm run perf:metrics` — live Polygon data, blockchain-validated block anchor; see metric definitions below. |
 
 ### Runtime Interpretation
 
@@ -124,6 +125,21 @@ The positive checks prove that the API, UI, build, exact calldata fork simulatio
 The live-cycle timeout is a real limitation. Under the current full dynamic discovery implementation, uncached historical discovery can exceed practical runtime limits on the current RPC/fork setup. This means the system is not yet proven as a 24/7 full-dynamic route lister without an indexed discovery cache, bounded incremental refresh, or a dedicated archive/indexing RPC layer.
 
 Do not interpret `LIVE_READY` as proof that the full discovery-to-opportunity loop is production-fast. It is a readiness gate, not a performance guarantee.
+
+### Performance Metrics Definitions
+
+`npm run perf:metrics` produces six sections from **live Polygon mainnet data**:
+
+| Section | What it measures |
+| --- | --- |
+| 1. Latency | Wall-clock time per pipeline phase: provider bootstrap, Aave reserve load, flashloan liquidity check, V2 pool discovery, V3/Algebra pool discovery, route enumeration, and quote computation. |
+| 2. Market coverage | Count of venues, anchor tokens, live pools, directed edges, route cycles, and quoted candidates. |
+| 3. Live pool state | On-chain reserves and estimated TVL per discovered V2 pool, anchored to the current block number. |
+| 4. Flashloan liquidity | Live token balances available at Aave V3 Pool and Balancer Vault for zero-capital flashloan entry. |
+| 5. Profitability | Per-route: gross profit (USD), flash fee (USD), gas cost (USD), net profit (USD), and `PROFITABLE`/`UNPROFITABLE` status. All figures use AMM constant-product math applied to live on-chain reserves. |
+| 6. Evidence summary | Consolidated proof: block number, gas price, total pipeline time, venue list, pool count, route count, profitable route count. |
+
+All figures are derived solely from on-chain state (no off-chain price API). Prices are seeded from USD stablecoins (`USDC`, `USDT`, `DAI`) and propagated through pool reserve ratios.
 
 ## Local Boot
 
@@ -173,6 +189,25 @@ Dynamic route cycle:
 ```powershell
 npm run live:cycle
 ```
+
+Performance metrics (profitability, latency, market coverage):
+
+```powershell
+npm run perf:metrics
+```
+
+Optional environment overrides for `perf:metrics`:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `POLYGON_RPC_URL` | public fallback | Polygon JSON-RPC endpoint |
+| `NATIVE_TOKEN_USD` | `0.40` | MATIC/POL price in USD for gas cost calculation |
+| `ESTIMATED_GAS_UNITS` | `450000` | Gas units per arbitrage transaction |
+| `SLIPPAGE_BPS` | `10` | Slippage floor applied to each quote step |
+| `SIM_MAX_FLASH_TVL_FRACTION` | `0.15` | Flashloan size as fraction of lowest pool TVL |
+| `MIN_NET_PROFIT_USD` | `1` | Minimum net profit threshold to mark a route `PROFITABLE` |
+| `PERF_MAX_CYCLES` | `500` | Maximum route cycles to enumerate (caps runtime) |
+| `MAX_ROUTE_HOPS` | `4` | Maximum hops per cyclic route |
 
 For performance diagnostics only, explicit environment bounds can be used. Bounded runs are not full-runtime proof:
 
