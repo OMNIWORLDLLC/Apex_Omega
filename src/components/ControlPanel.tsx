@@ -56,7 +56,7 @@ export default function ControlPanel({
   }
 
   return (
-    <div className="fixed bottom-4 right-4 z-50 bg-[#0d0e12] border border-[#1e2025] rounded-xl shadow-2xl p-4 w-[280px] text-white font-mono shadow-[0_0_30px_rgba(0,0,0,0.6)] backdrop-blur-xl">
+    <div className="fixed bottom-4 right-4 z-50 bg-[#0d0e12] border border-[#1e2025] rounded-xl p-4 w-[280px] text-white font-mono shadow-[inset_0_1px_0_rgba(255,255,255,0.07),inset_0_0_32px_rgba(0,0,0,0.38),0_0_30px_rgba(0,0,0,0.6)] glass-specular backdrop-blur-xl">
       <div className="flex justify-between items-center mb-4 border-b border-[#1e2025]/60 pb-2">
         <h3 className="text-[10px] font-bold text-cyan-400 uppercase tracking-widest flex items-center gap-2">
           <Activity size={12} className="text-cyan-400 animate-pulse" />

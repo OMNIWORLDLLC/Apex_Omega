@@ -46,7 +46,7 @@ export default function OracleFeeds() {
   }, [lastMessage]);
 
   return (
-    <div className="border border-[#1e2025] bg-[#0d0e12]/50 rounded-sm p-4 relative flex flex-col mt-2">
+    <div className="border border-[#1e2025] bg-[#0d0e12]/50 rounded-sm p-4 relative flex flex-col mt-2 glass-specular glass-inset">
       <div className="flex items-center justify-between border-b border-[#1e2025]/60 pb-2 mb-2 shrink-0">
         <div className="flex items-center gap-1.5 font-mono">
           <Radio

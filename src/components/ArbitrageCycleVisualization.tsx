@@ -72,7 +72,7 @@ export default function ArbitrageCycleVisualization() {
       </div>
 
       {/* Arbitrage Component */}
-      <div className="bg-[#090a0d] border border-[#1e2025] rounded-sm p-5 relative flex flex-col">
+      <div className="bg-[#090a0d] border border-[#1e2025] rounded-sm p-5 relative flex flex-col glass-specular glass-inset">
         <div className="text-[10px] uppercase font-bold text-cyan-400 mb-4 tracking-widest border-b border-[#1e2025]/60 pb-2">
           Arbitrage Family (C1 & C2)
         </div>
@@ -120,7 +120,7 @@ export default function ArbitrageCycleVisualization() {
       </div>
 
       {/* Liquidation Component */}
-      <div className="bg-[#090a0d] border border-[#1e2025] rounded-sm p-5 relative flex flex-col mt-4">
+      <div className="bg-[#090a0d] border border-[#1e2025] rounded-sm p-5 relative flex flex-col mt-4 glass-specular glass-inset">
         <div className="text-[10px] uppercase font-bold text-yellow-500 mb-4 tracking-widest border-b border-[#1e2025]/60 pb-2">
           Liquidation Family
         </div>

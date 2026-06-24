@@ -61,7 +61,7 @@ export default function WalletTab({
 
   return (
     <div className="space-y-4">
-      <div className="bg-[#090a0d] border border-[#1e2025] rounded-sm p-4">
+      <div className="bg-[#090a0d] border border-[#1e2025] rounded-sm p-4 glass-specular glass-inset">
         <h3 className="text-gray-300 font-mono text-[11px] uppercase flex items-center gap-2 mb-4">
           <Wallet size={13} className="text-[#00f5a0]" />
           Live Web3 Wallet Connection

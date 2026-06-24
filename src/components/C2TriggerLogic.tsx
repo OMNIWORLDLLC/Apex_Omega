@@ -78,7 +78,7 @@ export default function C2TriggerLogic() {
 
   if (!c1Confirmed) {
     return (
-      <div className="p-4 bg-slate-950 text-slate-100 rounded-xl border border-slate-800 shadow-2xl">
+      <div className="p-4 bg-slate-950 text-slate-100 rounded-xl border border-slate-800 shadow-[inset_0_1px_0_rgba(255,255,255,0.07),inset_0_0_32px_rgba(0,0,0,0.38),0_25px_50px_-12px_rgba(0,0,0,0.25)] glass-specular">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center gap-2">
             <Cpu className="w-5 h-5 text-gray-500" />
@@ -109,7 +109,7 @@ export default function C2TriggerLogic() {
   }
 
   return (
-    <div className="p-4 bg-slate-950 text-slate-100 rounded-xl border border-slate-800 shadow-2xl max-h-64 overflow-y-auto scrollbar-thin">
+    <div className="p-4 bg-slate-950 text-slate-100 rounded-xl border border-slate-800 shadow-[inset_0_1px_0_rgba(255,255,255,0.07),inset_0_0_32px_rgba(0,0,0,0.38),0_25px_50px_-12px_rgba(0,0,0,0.25)] glass-specular max-h-64 overflow-y-auto scrollbar-thin">
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
           <Cpu className="w-5 h-5 text-amber-500 animate-pulse" />

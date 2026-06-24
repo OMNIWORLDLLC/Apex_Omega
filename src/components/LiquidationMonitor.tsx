@@ -73,7 +73,7 @@ export default function LiquidationMonitor({
           Live Intersect: Aave V3 Polygon Pools
         </h3>
       </div>
-      <div className="border border-[#1e2025] rounded-sm bg-[#090a0d] overflow-hidden">
+      <div className="border border-[#1e2025] rounded-sm bg-[#090a0d] overflow-hidden glass-specular glass-inset">
         <table className="w-full text-left border-collapse text-[11px] font-mono">
           <thead>
             <tr className="border-b border-[#1e2025]/60 bg-[#0d0e12]/80 text-gray-500 uppercase tracking-wider text-[9px]">
