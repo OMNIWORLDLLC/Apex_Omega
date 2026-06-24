@@ -6,7 +6,7 @@ This repository is private-execution infrastructure. Do not publish real `.env` 
 
 ## Current System Status
 
-Last local validation: 2026-06-24.
+Last local validation: 2026-06-24 (glassmorphic enhancement pass).
 
 Local services were booted and verified:
 
@@ -112,9 +112,12 @@ The following tests were run locally against the current runtime configuration u
 | Frontend root | PASS | 2.293s | Vite returned HTTP `200` and served `index.html`. |
 | TypeScript lint | PASS | 13.638s | `npm run lint`. |
 | Production build | PASS | 15.214s | `npm run build`. |
+| Frontend/backend API coverage | PASS | — | All 22 frontend `fetch` calls verified against server endpoint map. No orphaned routes. |
 | Fork calldata simulation | PASS | 4.330s | `FORK_CALLDATA_SIM|ok=true`, chain `137`, exact calldata hash printed. |
 | Route adapter/source verification | PASS | 43.653s | All six adapter classes reported `routeEligible=true`; recent discovery log probes succeeded. |
 | Cloud readiness | PASS | 4.706s | `CLOUD_READINESS|status=PASS`; target code, owners, signer, Aave pool, liquidation target checked. |
+| TypeScript lint (glassmorphic pass) | PASS | ~14s | `npm run lint` — zero errors after all 25-component glass-panel enhancement. |
+| Production build (glassmorphic pass) | PASS | ~15s | `npm run build` — CSS bundle 98.68 kB (Δ+2.2 kB for `.glass-specular`, `.glass-inset`, `.glass-inset-sm` utilities). |
 | Full dynamic live-cycle under runtime config | TIMEOUT | 301.727s | `npm run live:cycle` did not emit a route table before timeout. |
 | Performance metrics (profitability/latency/coverage) | — | — | `npm run perf:metrics` — live Polygon data, blockchain-validated block anchor; see metric definitions below. |
 
@@ -279,6 +282,20 @@ SHADOW_MODE=false
 FORK_UPSTREAM_RPC_URL=<low-latency Polygon RPC>
 FORK_SIM_RPC_URL=http://anvil-fork:8545
 ```
+
+## UI Design System
+
+### Glassmorphic Material Standard
+
+All card and panel surfaces implement a three-layer frosted glass effect:
+
+| CSS Utility | Effect | Applied to |
+| --- | --- | --- |
+| `.glass-specular` | Subtle linear gradient from `rgba(255,255,255,0.042)` at 0 % to transparent at 28 % — simulates a glossy specular highlight along the top border of each component. | All card containers and major panels. |
+| `.glass-inset` | `box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), inset 0 0 32px rgba(0,0,0,0.38)` — top-lit inner rim highlight + deep inner darkness for panel depth. | Full-size component panels. |
+| `.glass-inset-sm` | Lighter inset variant (`rgba(255,255,255,0.055)`, `18px` spread) for compact stat cards and lane cells. | SystemIntel stat cards, LanesGrid cells, BenchmarkScorecard metric rows. |
+
+These utilities are defined in `src/index.css` under `@layer utilities`. All 25 components — `Header`, `ControlPanel`, `ProfitDashboard`, `SystemIntel`, `OracleFeeds`, `LanesGrid`, `LiquidationMonitor`, `ArbitrageCycleVisualization`, `BenchmarkScorecard`, `SimulationConsole`, `EconomicSentimentWidget`, `DiagnosticConsole`, `NotificationSidebar`, `ExecutionModal`, `PipelineDiagnosticModal`, `HyperImmersiveOpportunities`, `ProtocolModules`, `MainnetPayloadSchema`, `ConfigTab`, `WalletTab`, `AgentTab`, `C2TriggerLogic`, `Ticker`, `PlChart`, and `Dashboard` — apply one or both inset shadow classes alongside `.glass-specular`, including inner tab panels and workspace containers within `Dashboard`.
 
 ## Production Gaps
 

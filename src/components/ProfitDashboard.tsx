@@ -122,7 +122,7 @@ export default function ProfitDashboard({ data, recentTrades = [] }: ProfitDashb
   };
 
   return (
-    <div className="flex flex-col h-full bg-[#030408]/80 backdrop-blur-xl border border-[#1e2025] rounded-xl shadow-[0_8px_32px_rgba(0,0,0,0.8)] font-mono text-[10px] overflow-hidden relative">
+    <div className="flex flex-col h-full bg-[#030408]/80 backdrop-blur-xl border border-[#1e2025] rounded-xl shadow-[inset_0_1px_0_rgba(255,255,255,0.07),inset_0_0_32px_rgba(0,0,0,0.38),0_8px_32px_rgba(0,0,0,0.8)] glass-specular font-mono text-[10px] overflow-hidden relative">
       {/* Decorative gradient orb */}
       <div className="absolute top-0 right-0 w-64 h-64 bg-[#00f5a0]/5 rounded-full blur-[80px] pointer-events-none" />
       

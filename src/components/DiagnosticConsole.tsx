@@ -37,7 +37,7 @@ export default function DiagnosticConsole() {
   }
 
   return (
-    <div className="flex flex-col h-full bg-[#07080a] border border-[#1e2025] rounded-sm p-4 overflow-y-auto custom-scrollbar font-mono">
+    <div className="flex flex-col h-full bg-[#07080a] border border-[#1e2025] rounded-sm p-4 overflow-y-auto custom-scrollbar font-mono glass-specular glass-inset">
       <div className="flex items-center gap-2 mb-6 border-b border-[#1e2025] pb-3">
         <Server className="text-emerald-400" size={20} />
         <h2 className="text-lg font-bold text-white uppercase tracking-widest">

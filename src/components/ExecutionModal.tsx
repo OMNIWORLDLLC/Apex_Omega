@@ -126,7 +126,7 @@ export default function ExecutionModal({
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-      <div className="bg-[#0b0c10] border border-[#1e2025] rounded-lg shadow-2xl w-full max-w-2xl flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+      <div className="bg-[#0b0c10] border border-[#1e2025] rounded-lg shadow-[inset_0_1px_0_rgba(255,255,255,0.07),inset_0_0_32px_rgba(0,0,0,0.38),0_25px_50px_-12px_rgba(0,0,0,0.5)] glass-specular w-full max-w-2xl flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-200">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-[#1e2025] bg-[#0d0e12]">
           <div className="flex items-center gap-3">

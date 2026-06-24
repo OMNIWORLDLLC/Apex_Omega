@@ -100,7 +100,7 @@ const AaveInspectorTab = ({
   };
 
   return (
-    <div className="font-mono text-[10px] space-y-3 bg-[#0d0e12]/80 p-4 border border-[#1e2025] rounded-sm relative">
+    <div className="font-mono text-[10px] space-y-3 bg-[#0d0e12]/80 p-4 border border-[#1e2025] rounded-sm relative glass-specular glass-inset">
       <div className="absolute top-0 right-0 w-2 h-2 border-t-2 border-r-2 border-blue-500/50" />
       <div className="absolute bottom-0 left-0 w-2 h-2 border-b-2 border-l-2 border-blue-500/50" />
       <div className="flex items-center gap-2 mb-1 border-b border-[#1e2025]/50 pb-2">
@@ -778,7 +778,7 @@ const ReservesTab = () => {
   }, []);
 
   return (
-    <div className="font-mono text-[10px] border border-[#1e2025] bg-[#0d0e12]/80 rounded-sm p-2">
+    <div className="font-mono text-[10px] border border-[#1e2025] bg-[#0d0e12]/80 rounded-sm p-2 glass-specular glass-inset">
       <div className="overflow-x-auto">
         <table className="w-full text-left font-mono">
           <thead className="text-gray-500 border-b border-[#1e2025]">
@@ -851,7 +851,7 @@ const PricesTab = ({ addLog }: { addLog: (tag: any, msg: string) => void }) => {
 
   return (
     <div className="font-mono text-[10px] space-y-3">
-      <div className="border border-[#1e2025] bg-[#0d0e12]/80 rounded-sm p-3">
+      <div className="border border-[#1e2025] bg-[#0d0e12]/80 rounded-sm p-3 glass-specular glass-inset">
         <p className="text-gray-500 mb-2 leading-normal text-[8.5px]">
           Polygon decentralised price feeds sourced directly from Chainlink
           Mainnet feeds:
@@ -1419,7 +1419,7 @@ export default function Dashboard() {
         >
           {/* Reserve cache panel */}
           {layout.cache && (
-            <div className="border border-[#1e2025] bg-[#0d0e12]/50 rounded-sm p-4 shrink-0 relative">
+            <div className="border border-[#1e2025] bg-[#0d0e12]/50 rounded-sm p-4 shrink-0 relative glass-specular glass-inset">
               <div className="absolute top-0 right-0 w-2 h-2 border-t border-r border-[#b388ff]/40" />
 
               <h4 className="text-[10px] font-mono whitespace-nowrap uppercase tracking-wider text-white border-b border-[#1e2025]/60 pb-2 mb-2">
@@ -1485,7 +1485,7 @@ export default function Dashboard() {
         >
           {/* View Manager & Workspace Rows */}
           {layout.workspace && (
-            <div className="border border-[#1e2025] bg-[#0b0c10] rounded-sm flex flex-col flex-1 min-h-[380px] select-none shrink-0 relative overflow-hidden">
+            <div className="border border-[#1e2025] bg-[#0b0c10] rounded-sm flex flex-col flex-1 min-h-[380px] select-none shrink-0 relative overflow-hidden glass-specular glass-inset">
               {/* View Manager Controls */}
               <div className="bg-[#090a0d] border-b border-[#1e2025]/80 flex items-center px-4 py-2 gap-4 shrink-0 overflow-x-auto select-none font-mono text-[9px] uppercase">
                 <span className="text-gray-500 font-bold tracking-widest shrink-0">
@@ -1680,7 +1680,7 @@ export default function Dashboard() {
                         overflow: "hidden",
                       }}
                       transition={{ duration: 0.2 }}
-                      className="flex flex-col flex-1 shrink-0 min-h-[300px] bg-[#090a0d] border border-[#1e2025] rounded p-2"
+                      className="flex flex-col flex-1 shrink-0 min-h-[300px] bg-[#090a0d] border border-[#1e2025] rounded p-2 glass-specular glass-inset"
                     >
                       <WalletTab addLog={addLog} />
                     </motion.div>
@@ -1698,7 +1698,7 @@ export default function Dashboard() {
                         overflow: "hidden",
                       }}
                       transition={{ duration: 0.2 }}
-                      className="flex flex-col flex-1 shrink-0 min-h-[400px] bg-[#090a0d] border border-[#1e2025] rounded p-2"
+                      className="flex flex-col flex-1 shrink-0 min-h-[400px] bg-[#090a0d] border border-[#1e2025] rounded p-2 glass-specular glass-inset"
                     >
                       <ConfigTab setConfigChanged={fetchDashboardConfig} addLog={addLog} />
                     </motion.div>
@@ -1722,7 +1722,7 @@ export default function Dashboard() {
 
               {/* Pipeline Stage Counts and Completed blocks log */}
               {layout.executions && (
-                <div className="border border-[#1e2025] bg-[#0d0e12]/50 rounded-sm p-4 flex flex-col relative h-[380px]">
+                <div className="border border-[#1e2025] bg-[#0d0e12]/50 rounded-sm p-4 flex flex-col relative h-[380px] glass-specular glass-inset">
                   <div className="absolute top-0 right-0 w-2 h-2 border-t border-r border-[#b388ff]/40" />
                   <div className="flex justify-between items-center border-b border-[#1e2025]/60 pb-1.5 mb-1.5 shrink-0">
                     <span className="text-[10px] font-mono uppercase tracking-wider font-bold text-white">
