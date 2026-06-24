@@ -170,6 +170,18 @@ type Candidate = {
   c1ExecutionSlot?: number;
 };
 
+type ReverseRouteMetadata = {
+  available: boolean;
+  error?: string;
+  reverseFlashloanSource?: number;
+  reverseFlashloanAsset?: string;
+  reverseFlashloanAmount?: string;
+  reverseContext?: any;
+  reversePath?: string;
+  reverseVenues?: string;
+  sizingRule?: string;
+};
+
 type DiscoveryStats = {
   flashloanAssets: number;
   flashloanBalancerAssets: number;
@@ -1226,6 +1238,32 @@ function buildStepCalldata(edge: Edge, amountIn: bigint, minAmountOut: bigint, t
   throw new Error(`CALldata_UNSUPPORTED_INVARIANT:${edge.invariant}`);
 }
 
+function reverseEdge(edge: Edge): Edge {
+  const extra = edge.extra ? { ...edge.extra } : undefined;
+  if (extra?.balancerWeightIn !== undefined || extra?.balancerWeightOut !== undefined) {
+    const weightIn = extra.balancerWeightIn;
+    extra.balancerWeightIn = extra.balancerWeightOut;
+    extra.balancerWeightOut = weightIn;
+  }
+  return {
+    ...edge,
+    edgeId: `${edge.dexId}:${edge.poolAddress}:${edge.tokenOutSymbol}->${edge.tokenInSymbol}:reverse`,
+    tokenIn: edge.tokenOut,
+    tokenOut: edge.tokenIn,
+    tokenInIndex: edge.tokenOutIndex,
+    tokenOutIndex: edge.tokenInIndex,
+    tokenInDecimals: edge.tokenOutDecimals,
+    tokenOutDecimals: edge.tokenInDecimals,
+    tokenInSymbol: edge.tokenOutSymbol,
+    tokenOutSymbol: edge.tokenInSymbol,
+    tokenInPriceUsd: edge.tokenOutPriceUsd,
+    tokenOutPriceUsd: edge.tokenInPriceUsd,
+    reserveIn: edge.reserveOut,
+    reserveOut: edge.reserveIn,
+    extra,
+  };
+}
+
 function buildAdjacency(edges: Edge[]) {
   const byIn = new Map<string, Edge[]>();
   for (const edge of edges) {
@@ -1443,9 +1481,81 @@ function candidateToLedgerPayload(candidate: Candidate) {
   };
 }
 
+async function buildReverseRouteMetadata(
+  provider: ethers.JsonRpcProvider,
+  candidate: Candidate,
+  targetContract: string,
+  c1Nonce: bigint,
+): Promise<ReverseRouteMetadata> {
+  try {
+    if (!candidate.flashloanAsset.priceUsd) throw new Error("REVERSE_FLASHLOAN_ASSET_PRICE_MISSING");
+    const lowestPoolTvlUsd = Math.min(...candidate.steps.map((step) => step.edge.tvlUsd).filter((value) => Number.isFinite(value) && value > 0));
+    if (!Number.isFinite(lowestPoolTvlUsd) || lowestPoolTvlUsd <= 0) throw new Error("REVERSE_LOWEST_POOL_TVL_UNRESOLVED");
+
+    const targetAmountIn = floatToRaw(
+      (lowestPoolTvlUsd * numberEnv("SIM_MAX_FLASH_TVL_FRACTION", 0.15)) / candidate.flashloanAsset.priceUsd,
+      candidate.flashloanAsset.decimals,
+    );
+    const reverseFlashloanAmount = targetAmountIn <= candidate.flashloanLiquidity.liquidity
+      ? targetAmountIn
+      : candidate.flashloanLiquidity.liquidity;
+    if (reverseFlashloanAmount <= 0n) throw new Error("REVERSE_FLASHLOAN_SIZE_ZERO");
+
+    const slippageBps = BigInt(Math.floor(numberEnv("SLIPPAGE_BPS", 10)));
+    const deadline = Math.floor(Date.now() / 1000) + intEnv("EXECUTION_SUBMISSION_EXPIRY_SECONDS", 300);
+    const reverseSteps: RouteQuoteStep[] = [];
+    let amount = reverseFlashloanAmount;
+    for (const reverse of [...candidate.steps].reverse().map((step) => reverseEdge(step.edge))) {
+      const amountOut = await quoteEdge(provider, reverse, amount);
+      if (amountOut <= 0n) throw new Error("REVERSE_QUOTE_ZERO_OUTPUT");
+      const minAmountOut = bpsMin(amountOut, slippageBps);
+      const calldata = buildStepCalldata(reverse, amount, minAmountOut, targetContract, deadline);
+      reverseSteps.push({ edge: reverse, amountIn: amount, amountOut, minAmountOut, calldata });
+      amount = amountOut;
+    }
+
+    const flashFeeRaw = reverseFlashloanAmount * candidate.flashloanLiquidity.feeBps / 10000n;
+    const reverseContext = {
+      profitAsset: candidate.flashloanAsset.address,
+      minNetProfit: flashFeeRaw + 1n,
+      nonce: c1Nonce + 1n,
+      merkleRoot: ethers.ZeroHash,
+      proof: [],
+      steps: reverseSteps.map((step) => ({
+        venue: step.edge.executorTarget,
+        tokenIn: step.edge.tokenIn,
+        tokenOut: step.edge.tokenOut,
+        amountIn: step.amountIn,
+        minAmountOut: step.minAmountOut,
+        callValue: 0n,
+        payload: step.calldata,
+      })),
+    };
+
+    const reversePathSymbols = reverseSteps.map((step) => step.edge.tokenInSymbol);
+    reversePathSymbols.push(reverseSteps[reverseSteps.length - 1]?.edge.tokenOutSymbol || candidate.flashloanAsset.symbol);
+    return {
+      available: true,
+      reverseFlashloanSource: candidate.flashloanLiquidity.sourceCode,
+      reverseFlashloanAsset: candidate.flashloanAsset.address,
+      reverseFlashloanAmount: reverseFlashloanAmount.toString(),
+      reverseContext,
+      reversePath: reversePathSymbols.join("->"),
+      reverseVenues: reverseSteps.map((step) => `${step.edge.venueName}:${step.edge.invariant}`).join("->"),
+      sizingRule: "REVERSE_FLASHLOAN_SIZE=min(15% x lowest route TVL, provider liquidity)",
+    };
+  } catch (error: any) {
+    return {
+      available: false,
+      error: error?.message || "REVERSE_ROUTE_METADATA_BUILD_FAILED",
+    };
+  }
+}
+
 async function buildC1Context(provider: ethers.JsonRpcProvider, candidate: Candidate, targetContract: string) {
   const vm = new ethers.Contract(targetContract, VM_ABI, provider);
   const nonce = await vm.globalNonce().catch(() => 0n);
+  const reverseRouteMetadata = await buildReverseRouteMetadata(provider, candidate, targetContract, BigInt(nonce));
   return {
     profitAsset: candidate.flashloanAsset.address,
     minNetProfit: candidate.flashFeeRaw + 1n,
@@ -1461,6 +1571,14 @@ async function buildC1Context(provider: ethers.JsonRpcProvider, candidate: Candi
       callValue: 0n,
       payload: step.calldata,
     })),
+    routeMetadata: {
+      routeId: candidate.routeId,
+      mirrorPath: routePath(candidate),
+      mirrorVenues: routeVenues(candidate),
+      mirrorFlashloanAmount: candidate.amountIn.toString(),
+      reverseAutomation: reverseRouteMetadata.available ? "READY" : "UNAVAILABLE",
+      ...reverseRouteMetadata,
+    },
   };
 }
 

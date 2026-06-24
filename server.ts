@@ -945,6 +945,14 @@ async function startServer() {
     };
   };
 
+  const withFreshVmNonce = async (targetContract: string, context: any) => {
+    const nonce = await getVmGlobalNonce(targetContract);
+    return {
+      ...context,
+      nonce,
+    };
+  };
+
   const evaluateC2DecisionForBlock = async (instance: C2Instance, currentBlock: number): Promise<C2DecisionRecord> => {
     const cfg = getRuntimeConfig();
     const targetContract = instance.seed.targetContract || cfg.C2_ARB_EXECUTOR_ADDRESS || cfg.C2_TARGET || cfg.C1_ARB_EXECUTOR_ADDRESS || cfg.C1_TARGET || cfg.ARB_CONTRACT_ADDRESS;
@@ -978,13 +986,14 @@ async function startServer() {
 
     try {
       if (c2MirrorEnabled && targetContract && instance.seed.context) {
+        const mirrorContext = await withFreshVmNonce(targetContract, instance.seed.context);
         const mirrorResult = await defiExecutor.broadcastFlashloanIntegratedC2Payload(
           targetContract,
           instance.c1InternalId,
           Number(instance.seed.flashloanSource ?? DEFAULT_FLASHLOAN_SOURCE_AAVE_V3),
           instance.seed.flashloanAsset,
           instance.seed.flashloanAmount,
-          instance.seed.context,
+          mirrorContext,
         );
 
         if (mirrorResult.success && mirrorResult.hash) {
@@ -1011,13 +1020,14 @@ async function startServer() {
         if (c2ReverseEnabled) {
           const reversePayload = buildReverseC2PayloadFromSeed(instance);
           if (reversePayload.ok) {
+            const reverseContext = await withFreshVmNonce(targetContract, reversePayload.context);
             const reverseResult = await defiExecutor.broadcastFlashloanIntegratedC2Payload(
               targetContract,
               instance.c1InternalId,
               reversePayload.flashloanSource,
               reversePayload.flashloanAsset,
               reversePayload.flashloanAmount,
-              reversePayload.context,
+              reverseContext,
             );
             if (reverseResult.success && reverseResult.hash) {
               await releaseOpportunityLock(lock.id, "C2_REVERSE_PENDING", {
@@ -1933,6 +1943,7 @@ async function startServer() {
       if (!targetContract || !flashloanAsset || !flashloanAmount || !context) {
         return res.status(400).json({ success: false, error: "INVALID_C2_EVALUATION_PAYLOAD", currentBlock, decision });
       }
+      const c2Context = await withFreshVmNonce(targetContract, context);
 
       const result = await defiExecutor.broadcastFlashloanIntegratedC2Payload(
         targetContract,
@@ -1940,7 +1951,7 @@ async function startServer() {
         flashloanSource,
         flashloanAsset,
         flashloanAmount,
-        context,
+        c2Context,
       );
 
       const record: C2DecisionRecord = {

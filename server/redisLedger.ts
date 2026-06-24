@@ -234,6 +234,13 @@ export async function releaseOpportunityLock(id: string, status: string, patch: 
 export async function recordLaneEvent(event: LedgerPayload) {
   const client = await getRedisClient();
   if (!client) return;
-  await client.xAdd(laneSetKey(), "*", normalizeForJson(event));
+  const normalized = normalizeForJson(event);
+  const fields = Object.fromEntries(
+    Object.entries(normalized).map(([key, value]) => [
+      key,
+      typeof value === "string" ? value : JSON.stringify(value),
+    ]),
+  );
+  await client.xAdd(laneSetKey(), "*", fields);
   await client.xTrim(laneSetKey(), "MAXLEN", 2_000);
 }
