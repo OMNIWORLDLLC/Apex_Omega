@@ -18,6 +18,12 @@ import {
   type PoolEdge,
   ROUTE_ADAPTER_TARGETS,
 } from "../server/engine/routeAdapters.js";
+import {
+  enforceExecutionInvariants,
+  InvariantViolationError,
+  type QuotedRouteStep,
+  type RouteCostsInAsset,
+} from "../server/engine/executionInvariants.js";
 
 const CHAIN_ID = 137n;
 const API_BASE = process.env.APEX_API_BASE || "http://127.0.0.1:3000";
@@ -1176,6 +1182,7 @@ async function quoteCandidate(
   route: Edge[],
   targetContract: string,
   gasCostUsd: number,
+  bribesUsd: number,
   minProfitUsd: number,
 ) {
   const flashloanAsset = tokenCache.get(route[0].tokenIn.toLowerCase());
@@ -1207,18 +1214,57 @@ async function quoteCandidate(
 
   const amountOut = amount;
   const grossProfitRaw = amountOut - amountIn;
-  const repaymentRaw = amountIn + flashFeeRaw;
   const grossProfitUsd = quoteUsd(grossProfitRaw, flashloanAsset);
   const flashFeeUsd = quoteUsd(flashFeeRaw, flashloanAsset);
   const netProfitUsd = grossProfitUsd === undefined || flashFeeUsd === undefined
     ? undefined
-    : grossProfitUsd - flashFeeUsd - gasCostUsd - numberEnv("RISK_BUFFER_USD", 0);
-  const status = amountOut > repaymentRaw && netProfitUsd !== undefined && netProfitUsd >= minProfitUsd
-    ? "EXECUTABLE_PROFIT_CANDIDATE"
-    : "REJECTED_NO_PROFIT";
-  const rejectionReason = status === "EXECUTABLE_PROFIT_CANDIDATE"
-    ? "NONE"
-    : `NET_PROFIT_BELOW_MIN:${netProfitUsd === undefined ? "UNPRICED" : netProfitUsd.toFixed(6)}<${minProfitUsd}`;
+    : grossProfitUsd - flashFeeUsd - gasCostUsd - bribesUsd - numberEnv("RISK_BUFFER_USD", 0);
+
+  // Build invariant-check inputs.  Gas and bribe costs are converted from USD
+  // to flashloan-asset raw units so that the YIELD_INVARIANT can compare them
+  // against on-chain amounts in the same denomination.
+  const assetPriceUsd = flashloanAsset.priceUsd ?? 0;
+  const gasCostInAssetRaw = assetPriceUsd > 0
+    ? floatToRaw(gasCostUsd / assetPriceUsd, flashloanAsset.decimals)
+    : 0n;
+  const bribesInAssetRaw = assetPriceUsd > 0
+    ? floatToRaw(bribesUsd / assetPriceUsd, flashloanAsset.decimals)
+    : 0n;
+
+  const invariantSteps: QuotedRouteStep[] = steps.map((s) => ({
+    venueId: s.edge.edgeId,
+    tokenIn: s.edge.tokenIn,
+    tokenOut: s.edge.tokenOut,
+    amountIn: s.amountIn,
+    amountOut: s.amountOut,
+  }));
+
+  const routeCosts: RouteCostsInAsset = {
+    flashloanFeeRaw: flashFeeRaw,
+    gasCostInAssetRaw,
+    bribesInAssetRaw,
+  };
+
+  // Enforce all four execution invariants. Any violation causes this route to
+  // be discarded as REJECTED_INVARIANT_VIOLATION rather than broadcast.
+  let status: Candidate["status"] = "EXECUTABLE_PROFIT_CANDIDATE";
+  let rejectionReason = "NONE";
+
+  try {
+    enforceExecutionInvariants(invariantSteps, routeCosts);
+    // Additional threshold guard: net USD profit must meet the configured minimum.
+    if (netProfitUsd === undefined || netProfitUsd < minProfitUsd) {
+      status = "REJECTED_NO_PROFIT";
+      rejectionReason = `NET_PROFIT_BELOW_MIN:${netProfitUsd === undefined ? "UNPRICED" : netProfitUsd.toFixed(6)}<${minProfitUsd}`;
+    }
+  } catch (err) {
+    status = "REJECTED_ROUTE_INVALID";
+    if (err instanceof InvariantViolationError) {
+      rejectionReason = `${err.invariant}:${err.detail}`;
+    } else {
+      rejectionReason = `INVARIANT_CHECK_FAILED:${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
 
   return {
     routeId: "",
@@ -1246,12 +1292,18 @@ async function rankCandidates(provider: ethers.JsonRpcProvider, tokenCache: Map<
   const nativeUsd = numberEnv("NATIVE_TOKEN_USD", 1);
   const estimatedGasUnits = BigInt(intEnv("ESTIMATED_GAS_UNITS", 450000));
   const gasCostUsd = Number(estimatedGasUnits * gasPrice) / 1e18 * nativeUsd;
+  // Validator/MEV bribe cost in USD.  Configure via BRIBES_WEI (raw wei) or
+  // BRIBES_USD (direct USD value).  Defaults to 0 when neither is set.
+  const bribesWei = BigInt(process.env.BRIBES_WEI || "0");
+  const bribesUsd = process.env.BRIBES_USD
+    ? numberEnv("BRIBES_USD", 0)
+    : Number(bribesWei) / 1e18 * nativeUsd;
   const minProfitUsd = numberEnv("MIN_NET_PROFIT_USD", 5);
   const candidates: Candidate[] = [];
 
   for (const route of cycles) {
     try {
-      candidates.push(await quoteCandidate(provider, tokenCache, flashloanBook, route, targetContract, gasCostUsd, minProfitUsd));
+      candidates.push(await quoteCandidate(provider, tokenCache, flashloanBook, route, targetContract, gasCostUsd, bribesUsd, minProfitUsd));
     } catch {
       stats.routeCyclesRejectedQuote += 1;
     }
@@ -1262,7 +1314,7 @@ async function rankCandidates(provider: ethers.JsonRpcProvider, tokenCache: Map<
     candidate.rank = index + 1;
     candidate.routeId = `LIVE-${String(index + 1).padStart(6, "0")}`;
   });
-  return { candidates, gasCostUsd, minProfitUsd };
+  return { candidates, gasCostUsd, bribesUsd, minProfitUsd };
 }
 
 async function buildC1Context(provider: ethers.JsonRpcProvider, candidate: Candidate, targetContract: string) {
@@ -1306,11 +1358,11 @@ async function main() {
   const health = await getJson("/api/system/healthz").catch((error) => ({ success: false, error: error.message }));
   const readiness = await getJson("/api/system/readiness").catch((error) => ({ ready: false, error: error.message }));
   const { latestBlock, tokenCache, flashloanAssets, flashloanBook, edges, stats } = await discoverGraph(provider);
-  const { candidates, gasCostUsd, minProfitUsd } = await rankCandidates(provider, tokenCache, flashloanBook.byAsset, flashloanAssets, edges, stats, targetContract);
+  const { candidates, gasCostUsd, bribesUsd, minProfitUsd } = await rankCandidates(provider, tokenCache, flashloanBook.byAsset, flashloanAssets, edges, stats, targetContract);
   const maxPrint = optionalIntEnv("LIVE_ROUTE_PRINT_LIMIT");
 
-  console.log(`LIVE_CYCLE_START|chainId=${network.chainId}|block=${latestBlock}|api=${API_BASE}|serverHealth=${health.status || health.success}|serverReady=${readiness.status || readiness.ready}|broadcastPolicy=ONLY_AFTER_PROFIT_AND_FORK_PASS|routeMode=FULL_DYNAMIC_GRAPH|assetMode=BALANCER_FIRST_AAVE_FALLBACK_FLASHLOAN_LIQUIDITY|pnlUpdated=false`);
-  console.log(`DISCOVERY_SUMMARY|flashloanAssets=${stats.flashloanAssets}|flashloanBalancerAssets=${stats.flashloanBalancerAssets}|flashloanAaveAssets=${stats.flashloanAaveAssets}|tokens=${stats.tokens}|discoveredPools=${stats.discoveredPools}|directedEdges=${stats.discoveredEdges}|sourceCounts=${JSON.stringify(stats.sourceCounts)}|rejectedMetadata=${stats.rejectedMetadata}|rejectedZeroLiquidity=${stats.rejectedZeroLiquidity}|rejectedDuplicateEdge=${stats.rejectedDuplicateEdge}|rejectedUnsupportedInvariant=${stats.rejectedUnsupportedInvariant}|rejectedPreSend=${stats.rejectedPreSend}|rejectedLogScanChunks=${stats.rejectedLogScan}|routeCycles=${stats.routeCyclesEnumerated}|routeQuoteRejects=${stats.routeCyclesRejectedQuote}|truncated=${stats.truncated}|gasCostUsd=${gasCostUsd.toFixed(6)}|minProfitUsd=${minProfitUsd}|pnlUpdated=false`);
+  console.log(`LIVE_CYCLE_START|chainId=${network.chainId}|block=${latestBlock}|api=${API_BASE}|serverHealth=${health.status || health.success}|serverReady=${readiness.status || readiness.ready}|broadcastPolicy=ONLY_AFTER_ALL_INVARIANTS_PASS|routeMode=FULL_DYNAMIC_OMNI_DIRECTIONAL|venueMode=VENUE_AGNOSTIC|directionMode=DIRECTION_AGNOSTIC|assetMode=BALANCER_FIRST_AAVE_FALLBACK_FLASHLOAN_LIQUIDITY|pnlUpdated=false`);
+  console.log(`DISCOVERY_SUMMARY|flashloanAssets=${stats.flashloanAssets}|flashloanBalancerAssets=${stats.flashloanBalancerAssets}|flashloanAaveAssets=${stats.flashloanAaveAssets}|tokens=${stats.tokens}|discoveredPools=${stats.discoveredPools}|directedEdges=${stats.discoveredEdges}|sourceCounts=${JSON.stringify(stats.sourceCounts)}|rejectedMetadata=${stats.rejectedMetadata}|rejectedZeroLiquidity=${stats.rejectedZeroLiquidity}|rejectedDuplicateEdge=${stats.rejectedDuplicateEdge}|rejectedUnsupportedInvariant=${stats.rejectedUnsupportedInvariant}|rejectedPreSend=${stats.rejectedPreSend}|rejectedLogScanChunks=${stats.rejectedLogScan}|routeCycles=${stats.routeCyclesEnumerated}|routeQuoteRejects=${stats.routeCyclesRejectedQuote}|truncated=${stats.truncated}|gasCostUsd=${gasCostUsd.toFixed(6)}|bribesUsd=${bribesUsd.toFixed(6)}|minProfitUsd=${minProfitUsd}|invariants=VENUE_AGNOSTIC+DIRECTION_AGNOSTIC+PRICE_INVARIANT+YIELD_INVARIANT|pnlUpdated=false`);
   console.log(`FLASHLOAN_LIQUIDITY|${flashloanBook.ordered.map((item) => `${item.provider}:${item.asset.symbol}:${item.asset.address}:liquidity=${ethers.formatUnits(item.liquidity, item.asset.decimals)}:feeBps=${item.feeBps}`).join(",")}`);
   console.log(`FLASHLOAN_ASSETS|${flashloanAssets.map((asset) => `${asset.symbol}:${asset.address}`).join(",")}`);
   console.log(`PRICE_MAP|${JSON.stringify(Object.fromEntries(Array.from(tokenCache.values()).filter((token) => token.priceUsd).map((token) => [token.symbol, Number(token.priceUsd?.toFixed(8))])))}`);
