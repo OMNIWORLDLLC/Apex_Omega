@@ -1,0 +1,64 @@
+# Cloud Build pipeline for Apex Omega V2
+# Builds the Docker image, pushes it to Artifact Registry, and deploys to Cloud Run.
+#
+# Required Cloud Build substitution variables (set in the trigger):
+#   _SERVICE_NAME  — Cloud Run service name (default: apex-omega)
+#   _REGION        — Cloud Run region        (default: us-central1)
+#   _AR_REPO       — Artifact Registry repo  (default: apex-omega)
+#
+# The deploy step passes --remove-annotations=run.googleapis.com/sources to clear
+# any stale source annotation left by a prior source-based deployment, which would
+# otherwise cause:
+#   ERROR: spec.template.metadata.annotations[run.googleapis.com/sources]:
+#          Source annotation has sources that are not referenced by a container.
+
+substitutions:
+  _SERVICE_NAME: apex-omega
+  _REGION: us-central1
+  _AR_REPO: apex-omega
+
+steps:
+  # Step 0 – Build the production image
+  - name: gcr.io/cloud-builders/docker
+    id: Build
+    args:
+      - build
+      - --tag
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$COMMIT_SHA
+      - --tag
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:latest
+      - --cache-from
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:latest
+      - .
+
+  # Step 1 – Push both tags
+  - name: gcr.io/cloud-builders/docker
+    id: Push
+    args:
+      - push
+      - --all-tags
+      - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_SERVICE_NAME
+    waitFor:
+      - Build
+
+  # Step 2 – Deploy to Cloud Run
+  # --remove-annotations=run.googleapis.com/sources drops the stale source
+  # annotation that causes deployment to fail when containers have changed.
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: Deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - services
+      - update
+      - $_SERVICE_NAME
+      - --image=$_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$COMMIT_SHA
+      - --region=$_REGION
+      - --remove-annotations=run.googleapis.com/sources
+      - --quiet
+    waitFor:
+      - Push
+
+images:
+  - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:$COMMIT_SHA
+  - $_REGION-docker.pkg.dev/$PROJECT_ID/$_AR_REPO/$_SERVICE_NAME:latest
