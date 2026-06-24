@@ -19,6 +19,7 @@ import {
 const CONFIG_PATH = path.join(process.cwd(), "config.json");
 const TOP_ROUTE_DISPLAY_LIMIT = Number(process.env.TOP_ROUTE_DISPLAY_LIMIT || 50);
 const C1_EXECUTABLE_LIMIT_PER_CYCLE = Number(process.env.C1_EXECUTABLE_LIMIT_PER_CYCLE || 10);
+const C2_PER_C1_LIMIT = Number(process.env.C2_PER_C1_LIMIT || 5);
 const C2_DECISION_LIMIT_PER_CYCLE = Number(process.env.C2_DECISION_LIMIT_PER_CYCLE || 50);
 
 function readConfigFile(): Record<string, any> {
@@ -890,13 +891,25 @@ async function startServer() {
     return 0;
   };
 
-  const serializeC2Instance = (instance: C2Instance) => ({
-    ...instance,
-    seed: {
-      ...instance.seed,
-      context: instance.seed.context,
-    },
-  });
+  const serializeC2Instance = (instance: C2Instance) => {
+    const actionDecisions = instance.decisions.filter((item) => item.decision === "MIRROR" || item.decision === "REVERSE");
+    return {
+      ...instance,
+      maxC2PerC1: C2_PER_C1_LIMIT,
+      c2SlotsUsed: instance.decisions.filter((item) => item.decision !== "EXPIRED").length,
+      c2ActionTxCount: actionDecisions.filter((item) => item.txHash).length,
+      c2ActionHashes: actionDecisions.filter((item) => item.txHash).map((item) => ({
+        blockNumber: item.blockNumber,
+        decision: item.decision,
+        txHash: item.txHash,
+        txHashLink: item.txHashLink,
+      })),
+      seed: {
+        ...instance.seed,
+        context: instance.seed.context,
+      },
+    };
+  };
 
   const c2ListenerEnabled = process.env.C2_LISTENER_ENABLED !== "false";
   let lastC2ListenerBlock = 0;
@@ -1171,6 +1184,12 @@ async function startServer() {
         }
         if (instance.status !== "PENDING") continue;
         if (currentBlock < instance.firstEligibleBlock) continue;
+        if (instance.decisions.filter((item) => item.decision !== "EXPIRED").length >= C2_PER_C1_LIMIT) {
+          instance.status = "EXPIRED";
+          instance.finalDecision = instance.finalDecision || "EXPIRED";
+          systemLogQueue.push({ tag: "C2", message: `C2 SLOT LIMIT: C1 ${instance.c1HashLink} already used ${C2_PER_C1_LIMIT}/${C2_PER_C1_LIMIT} block slots.` });
+          continue;
+        }
 
         if (currentBlock > instance.expiresAfterBlock) {
           instance.status = "EXPIRED";
@@ -1492,8 +1511,10 @@ async function startServer() {
       routeLimits: {
         topRouteDisplayLimit: TOP_ROUTE_DISPLAY_LIMIT,
         c1ExecutableLimitPerCycle: C1_EXECUTABLE_LIMIT_PER_CYCLE,
+        c2PerC1Limit: C2_PER_C1_LIMIT,
         c2DecisionLimitPerCycle: C2_DECISION_LIMIT_PER_CYCLE,
         c2DecisionCount,
+        c2CapacityFormula: `${C1_EXECUTABLE_LIMIT_PER_CYCLE} C1 x ${C2_PER_C1_LIMIT} C2 = ${C1_EXECUTABLE_LIMIT_PER_CYCLE * C2_PER_C1_LIMIT}`,
         c2RequiresConfirmedC1: true,
       },
 
@@ -1533,8 +1554,10 @@ async function startServer() {
         visibleRoutes: activeOpportunities.length,
         c1ExecutableVisible,
         c1ExecutableLimitPerCycle: C1_EXECUTABLE_LIMIT_PER_CYCLE,
+        c2PerC1Limit: C2_PER_C1_LIMIT,
         c2DecisionLimitPerCycle: C2_DECISION_LIMIT_PER_CYCLE,
         c2DecisionCount,
+        c2CapacityFormula: `${C1_EXECUTABLE_LIMIT_PER_CYCLE} C1 x ${C2_PER_C1_LIMIT} C2 = ${C1_EXECUTABLE_LIMIT_PER_CYCLE * C2_PER_C1_LIMIT}`,
         c2RequiresConfirmedC1: true,
       },
       diagnostics: {
@@ -1551,6 +1574,7 @@ async function startServer() {
           top_50_routes_visible: Math.min(activeOpportunities.length, TOP_ROUTE_DISPLAY_LIMIT),
           c1_executable_visible: c1ExecutableVisible,
           c1_executable_limit_per_cycle: C1_EXECUTABLE_LIMIT_PER_CYCLE,
+          c2_per_c1_limit: C2_PER_C1_LIMIT,
           c2_decision_limit_per_cycle: C2_DECISION_LIMIT_PER_CYCLE,
           c2_decision_count: c2DecisionCount,
           summary: reservePoolsCount > 0 ? "Live reserves polled successfully" : "Awaiting live reserve sync",
@@ -1714,14 +1738,53 @@ async function startServer() {
           payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
         });
       }
+      const liveBlockHex = await queryPolygonRPC("eth_blockNumber", []);
+      const currentBlock = parseRpcBlockNumber(liveBlockHex);
+      if (currentBlock < pairedC1Instance.firstEligibleBlock || currentBlock > pairedC1Instance.expiresAfterBlock) {
+        return res.status(409).json({
+          success: false,
+          error: "C2_BLOCK_OUTSIDE_C1_WINDOW",
+          currentBlock,
+          firstEligibleBlock: pairedC1Instance.firstEligibleBlock,
+          expiresAfterBlock: pairedC1Instance.expiresAfterBlock,
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+        });
+      }
+      if (pairedC1Instance.decisions.some((item) => item.blockNumber === currentBlock)) {
+        return res.status(409).json({
+          success: false,
+          error: "C2_BLOCK_ALREADY_EVALUATED",
+          currentBlock,
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+        });
+      }
+      if (pairedC1Instance.decisions.filter((item) => item.decision !== "EXPIRED").length >= C2_PER_C1_LIMIT) {
+        pairedC1Instance.status = "EXPIRED";
+        pairedC1Instance.finalDecision = pairedC1Instance.finalDecision || "EXPIRED";
+        return res.status(409).json({
+          success: false,
+          error: "C2_PER_C1_LIMIT_REACHED",
+          limit: C2_PER_C1_LIMIT,
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+        });
+      }
 
       const result = await defiExecutor.broadcastFlashloanIntegratedC2Payload(targetContract, c1InternalId, flashloanSource, flashloanAsset, flashloanAmount, context);
+      const record: C2DecisionRecord = {
+        blockNumber: currentBlock,
+        decision: "MIRROR",
+        createdAt: Date.now(),
+        routeEvaluation: { source: "DIRECT_C2_ENDPOINT", gate: result.success ? "ACTIONABLE" : "BLOCKED" },
+        result,
+      };
 
       if (result.success) {
         globalTxCounter++;
         totalSettledCycles++;
         bumpStage("C2_EXECUTION");
         if (result.hash) {
+          record.txHash = result.hash;
+          record.txHashLink = result.hashLink || getExplorerTxLink(result.hash);
           const profitReceiver = getConfiguredProfitReceiver();
           const profitAsset = getConfiguredProfitAsset();
           pendingSettlements.set(result.hash.toLowerCase(), {
@@ -1737,6 +1800,11 @@ async function startServer() {
           });
           systemLogQueue.push({ tag: "C2", message: `HASH PRINTED: ${result.hashLink || getExplorerTxLink(result.hash)} | P&L locked pending AI/on-chain verification for ${profitReceiver}` });
         }
+      }
+      pairedC1Instance.decisions.push(record);
+      if (pairedC1Instance.decisions.filter((item) => item.decision !== "EXPIRED").length >= C2_PER_C1_LIMIT || currentBlock >= pairedC1Instance.expiresAfterBlock) {
+        pairedC1Instance.status = "EXPIRED";
+        pairedC1Instance.finalDecision = pairedC1Instance.finalDecision || "EXPIRED";
       }
 
       res.status(result.success ? 200 : 409).json(result);
@@ -1808,6 +1876,17 @@ async function startServer() {
           instance: serializeC2Instance(instance),
         });
       }
+      if (instance.decisions.filter((item) => item.decision !== "EXPIRED").length >= C2_PER_C1_LIMIT) {
+        instance.status = "EXPIRED";
+        instance.finalDecision = instance.finalDecision || "EXPIRED";
+        return res.status(409).json({
+          success: false,
+          error: "C2_PER_C1_LIMIT_REACHED",
+          limit: C2_PER_C1_LIMIT,
+          currentBlock,
+          instance: serializeC2Instance(instance),
+        });
+      }
 
       bumpStage("C2_RECOMPUTE_FROM_PAIRED_C1");
 
@@ -1875,7 +1954,6 @@ async function startServer() {
       if (result.success && result.hash) {
         record.txHash = result.hash;
         record.txHashLink = result.hashLink || getExplorerTxLink(result.hash);
-        instance.status = "EXECUTED";
         instance.executedAt = Date.now();
         instance.finalDecision = decision;
         instance.c2Hash = result.hash;
@@ -1905,6 +1983,10 @@ async function startServer() {
       }
 
       instance.decisions.push(record);
+      if (instance.decisions.filter((item) => item.decision !== "EXPIRED").length >= C2_PER_C1_LIMIT || currentBlock >= instance.expiresAfterBlock) {
+        instance.status = "EXPIRED";
+        instance.finalDecision = instance.finalDecision || "EXPIRED";
+      }
       res.status(result.success ? 200 : 409).json({
         success: result.success,
         decision,

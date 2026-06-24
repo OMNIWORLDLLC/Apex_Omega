@@ -32,6 +32,7 @@ export default function HyperImmersiveOpportunities({ opportunities, diagnostics
   const visibleRoutes = routeLimits.visibleRoutes ?? opportunities.length;
   const c1ExecutableVisible = discovery.c1_executable_visible ?? routeLimits.c1ExecutableVisible ?? opportunities.filter((opp) => opp.c1ExecutionEligible || opp.status === "EXECUTABLE_PROFIT_CANDIDATE").length;
   const c1Limit = routeLimits.c1ExecutableLimitPerCycle ?? discovery.c1_executable_limit_per_cycle ?? 10;
+  const c2PerC1Limit = routeLimits.c2PerC1Limit ?? discovery.c2_per_c1_limit ?? 5;
   const c2Limit = routeLimits.c2DecisionLimitPerCycle ?? discovery.c2_decision_limit_per_cycle ?? 50;
   const c2DecisionCount = routeLimits.c2DecisionCount ?? discovery.c2_decision_count ?? 0;
   const statusText = connectionStatus === "live"
@@ -99,7 +100,7 @@ export default function HyperImmersiveOpportunities({ opportunities, diagnostics
             <span className="text-emerald-300 font-bold">{c1ExecutableVisible}/{c1Limit}</span>
           </div>
           <div className="border border-cyan-500/15 bg-black/30 rounded-md px-3 py-2">
-            <span className="block text-gray-600">C2 Decisions</span>
+            <span className="block text-gray-600">C2 {c1Limit}x{c2PerC1Limit}</span>
             <span className="text-yellow-300 font-bold">{c2DecisionCount}/{c2Limit}</span>
           </div>
         </div>
