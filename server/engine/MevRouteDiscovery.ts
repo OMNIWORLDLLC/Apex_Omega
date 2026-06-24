@@ -208,11 +208,12 @@ export class MevRouteDiscoveryEngine {
    * Initialize discovery context from live chain state
    */
   async initializeContext(): Promise<DiscoveryContext> {
-    const [blockNumber, blockData, gasPrice] = await Promise.all([
+    const [blockNumber, blockData, feeData] = await Promise.all([
       this.provider.getBlockNumber(),
       this.provider.getBlock("latest"),
-      this.provider.getGasPrice(),
+      this.provider.getFeeData(),
     ]);
+    const gasPrice = feeData.gasPrice || 0n;
 
     this.context = {
       provider: this.provider,
