@@ -9,3 +9,4 @@ coverage/
 !*.example
 config.json
 config.json.bak
+runtime-metrics.json
