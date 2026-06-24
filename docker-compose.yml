@@ -1,6 +1,26 @@
 name: apex-omega
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: apex-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --requirepass ${REDIS_PASSWORD:-apex_redis_secret}
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-apex_redis_secret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - apex-net
+
   anvil-fork:
     image: ghcr.io/foundry-rs/foundry:latest
     container_name: apex-anvil-fork
@@ -37,6 +57,8 @@ services:
     depends_on:
       anvil-fork:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     ports:
       - "${APEX_HOST_PORT:-3000}:3000"
     env_file:
@@ -49,6 +71,7 @@ services:
       REQUIRE_CHAIN_ID_MATCH: ${REQUIRE_CHAIN_ID_MATCH:-true}
       RPC_REQUIRE_CHAIN_ID: ${RPC_REQUIRE_CHAIN_ID:-137}
       FORK_SIM_RPC_URL: http://anvil-fork:8545
+      REDIS_URL: redis://:${REDIS_PASSWORD:-apex_redis_secret}@redis:6379
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval: 30s

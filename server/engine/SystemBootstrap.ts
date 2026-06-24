@@ -19,6 +19,7 @@
 
 import { ethers } from "ethers";
 import MevRouteDiscoveryEngine, { type ArbitrageRoute } from "./MevRouteDiscovery.js";
+import RedisRouteGuard, { routeKeyFromArbitrageRoute } from "./RedisRouteGuard.js";
 
 // ============================================================================
 // ABI REGISTRY – pre-loaded once at bootstrap time
@@ -191,7 +192,8 @@ export default class SystemBootstrap {
     private readonly targetContractAddress: string,
     private readonly flashloanAssetAddress: string,
     private readonly executorPrivateKey?: string,
-    private readonly maticPriceUsd: number = 0.72
+    private readonly maticPriceUsd: number = 0.72,
+    private readonly routeGuard: RedisRouteGuard | null = null
   ) {}
 
   // ── 1. RPC & NETWORK INITIALIZATION ─────────────────────────────────────
@@ -458,11 +460,46 @@ export default class SystemBootstrap {
           searchDepth,
           minProfitUSD
         );
-        const selectedRoute = discoveredRoutes[0];
+
+        // Helper: build the Redis key for an ArbitrageRoute
+        const routeKey = (r: ArbitrageRoute) =>
+          routeKeyFromArbitrageRoute({
+            tokenIn: r.tokenIn,
+            tokenOut: r.tokenOut,
+            legs: r.legs.map((l) => ({
+              venue: l.venueId,
+              tokenIn: l.tokenIn,
+              tokenOut: l.tokenOut,
+            })),
+          });
+
+        // ── Redis: filter out routes already claimed by another worker ──────
+        let eligibleRoutes = discoveredRoutes;
+        if (this.routeGuard) {
+          const lockChecks = await Promise.all(
+            discoveredRoutes.map((r) => this.routeGuard!.isLocked(routeKey(r)))
+          );
+          eligibleRoutes = discoveredRoutes.filter((_, idx) => !lockChecks[idx]);
+        }
+
+        // ── Select best unlocked route and acquire its lock ─────────────────
+        const selectedRoute = eligibleRoutes[0] ?? null;
+        if (selectedRoute && this.routeGuard) {
+          const acquired = await this.routeGuard.tryAcquireLock(routeKey(selectedRoute));
+          if (!acquired) {
+            // Another worker claimed this route between the isLocked check and
+            // tryAcquireLock. Treat the cycle as no-route rather than racing.
+            const duration_ms = Date.now() - startedAt;
+            cycles.push({ cycleId, status: "NO_ROUTE", duration_ms, discoveredRoutes, selectedRoute: undefined });
+            totalDuration_ms += duration_ms;
+            continue;
+          }
+        }
+
         const duration_ms = Date.now() - startedAt;
         const status = selectedRoute ? "SUCCESS" : "NO_ROUTE";
 
-        cycles.push({ cycleId, status, duration_ms, discoveredRoutes, selectedRoute });
+        cycles.push({ cycleId, status, duration_ms, discoveredRoutes, selectedRoute: selectedRoute ?? undefined });
         totalDuration_ms += duration_ms;
 
         if (selectedRoute) {
