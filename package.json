@@ -20,7 +20,7 @@
     "cloud:readiness": "tsx scripts/cloud-readiness.ts",
     "live:cycle": "tsx scripts/live-cycle.ts",
     "perf:metrics": "tsx scripts/perf-metrics.ts",
-    "perf:metrics:snapshot": "tsx scripts/perf-metrics.ts -- --snapshot"
+    "perf:metrics:snapshot": "tsx scripts/perf-metrics.ts --snapshot"
   },
   "dependencies": {
     "@google/genai": "^1.52.0",

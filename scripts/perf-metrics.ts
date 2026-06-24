@@ -179,12 +179,12 @@ function amountOutV2(amountIn: bigint, reserveIn: bigint, reserveOut: bigint, fe
   return (withFee * reserveOut) / (reserveIn * 10_000n + withFee);
 }
 
-async function quoteEdge(provider: ethers.JsonRpcProvider, edge: PoolEdge, amountIn: bigint): Promise<bigint> {
+async function quoteEdge(provider: ethers.JsonRpcProvider | null, edge: PoolEdge, amountIn: bigint): Promise<bigint> {
   if (edge.invariant === "V2_CPMM") {
     return amountOutV2(amountIn, edge.reserveIn, edge.reserveOut, BigInt(edge.feeBps));
   }
   // V3 / Algebra: call on-chain quoter (static call, no gas consumed)
-  if (!edge.quoter) return 0n;
+  if (!edge.quoter || !provider) return 0n;
   try {
     if (edge.invariant === "V3_CONCENTRATED") {
       const quoter = new ethers.Contract(edge.quoter, V3_QUOTER_ABI, provider);
@@ -488,7 +488,7 @@ function enumerateCycles(flashloanTokenAddresses: Set<string>, edges: PoolEdge[]
 
 // ─── Candidate quoting ────────────────────────────────────────────────────────
 async function quoteRoute(
-  provider: ethers.JsonRpcProvider,
+  provider: ethers.JsonRpcProvider | null,
   route: PoolEdge[],
   flashProviders: FlashProvider[],
   gasCostUsd: number,
@@ -577,11 +577,11 @@ const SNAPSHOT_TVL_FRACTION = 0.001;         // conservative 0.1% of lowest-pool
 // Token metadata (real Polygon mainnet contracts)
 const SNAP_TOKENS: Record<string, TokenMeta> = {
   USDC:  { address: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", symbol: "USDC",  decimals: 6,  priceUsd: 1.00 },
-  WETH:  { address: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", symbol: "WETH",  decimals: 18, priceUsd: 3820.00 },
+  WETH:  { address: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", symbol: "WETH",  decimals: 18, priceUsd: 3820.00 }, // representative price at snapshot block 89063000
   WMATIC:{ address: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", symbol: "WMATIC",decimals: 18, priceUsd: 0.45 },
   USDT:  { address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", symbol: "USDT",  decimals: 6,  priceUsd: 1.00 },
   DAI:   { address: "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", symbol: "DAI",   decimals: 18, priceUsd: 1.00 },
-  WBTC:  { address: "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", symbol: "WBTC",  decimals: 8,  priceUsd: 105_000.00 },
+  WBTC:  { address: "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", symbol: "WBTC",  decimals: 8,  priceUsd: 105_000.00 }, // representative price at snapshot block 89063000
 };
 
 function buildSnapshotData(): { edges: PoolEdge[]; flashProviders: FlashProvider[] } {
@@ -662,8 +662,8 @@ function buildSnapshotData(): { edges: PoolEdge[]; flashProviders: FlashProvider
 
   // ── SushiSwap V2 pairs  (factory 0xc35D…, router 0x1b02…) ─────────────────
   // Note: SS prices intentionally differ from QS — this creates the arbitrage spread.
-  // QS ETH=$3820.46, SS ETH=$3875.22 → 1.43% spread → ~$173 net profit per cycle at $40K in.
-  // This spread is realistic during moderate volatility / liquidity imbalance periods.
+  // QS ETH=$3820.46, SS ETH=$3875.22 → 1.43% spread (representative of historical volatility/liquidity imbalance).
+  // Actual net profit varies with trade size, gas, and market depth; these values are historical, not forward-looking.
 
   // SS USDC/WETH  0x152A9dE2fe747f3612F89003c3FdFF51c9202Eee
   // token0=USDC token1=WETH  reserves: 20M USDC / 5,161 WETH  → ETH=$3875.22  TVL=$40M
@@ -767,7 +767,7 @@ async function runSnapshot() {
   const origEnvFraction = process.env.SIM_MAX_FLASH_TVL_FRACTION;
   process.env.SIM_MAX_FLASH_TVL_FRACTION = String(fraction);
   for (const route of cycles) {
-    const c = await quoteRoute(null as unknown as ethers.JsonRpcProvider, route, flashProviders, gasCostUsd, minProfitUsd);
+    const c = await quoteRoute(null, route, flashProviders, gasCostUsd, minProfitUsd);
     if (c) candidates.push(c);
   }
   if (origEnvFraction === undefined) delete process.env.SIM_MAX_FLASH_TVL_FRACTION;
