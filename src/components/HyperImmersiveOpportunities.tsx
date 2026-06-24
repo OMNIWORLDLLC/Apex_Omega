@@ -14,10 +14,17 @@ interface Opportunity {
 
 interface HyperImmersiveOpportunitiesProps {
   opportunities: Opportunity[];
+  diagnostics?: any;
+  connectionStatus?: "live" | "poll" | "reconnecting" | "connecting" | "error";
 }
 
-export default function HyperImmersiveOpportunities({ opportunities }: HyperImmersiveOpportunitiesProps) {
+export default function HyperImmersiveOpportunities({ opportunities, diagnostics, connectionStatus = "poll" }: HyperImmersiveOpportunitiesProps) {
   const [activeId, setActiveId] = useState<number | null>(null);
+  const discovery = diagnostics?.discovery || {};
+  const statusText = connectionStatus === "live"
+    ? diagnostics?.summary || "Live opportunity feed connected"
+    : "API feed disconnected or returning invalid data";
+  const statusTone = connectionStatus === "live" ? "text-cyan-400" : "text-red-400";
 
   // Background grid animation logic could be added here
   
@@ -47,8 +54,10 @@ export default function HyperImmersiveOpportunities({ opportunities }: HyperImme
                 HYPER IMMERSIVE 2.0
               </h2>
               <div className="flex items-center gap-2 mt-1">
-                <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-                <span className="text-xs tracking-widest text-cyan-500/70 uppercase">Nexus Detection Matrix active</span>
+                <span className={`w-2 h-2 rounded-full ${connectionStatus === "live" ? "bg-cyan-400" : "bg-red-500"} animate-pulse`} />
+                <span className={`text-xs tracking-widest uppercase ${connectionStatus === "live" ? "text-cyan-500/70" : "text-red-400/80"}`}>
+                  {connectionStatus === "live" ? "Nexus Detection Matrix active" : "API feed not synchronized"}
+                </span>
               </div>
             </div>
           </div>
@@ -144,10 +153,34 @@ export default function HyperImmersiveOpportunities({ opportunities }: HyperImme
             </AnimatePresence>
             
             {opportunities.length === 0 && (
-              <div className="col-span-full h-40 flex flex-col items-center justify-center border border-dashed border-[#1e2025] rounded-xl text-gray-600">
-                <ShieldAlert className="w-8 h-8 mb-3 opacity-50" />
-                <span className="text-xs uppercase tracking-widest font-bold">Scanning Nexus Grid...</span>
-                <span className="text-[10px] mt-1">Awaiting live arbitrage vectors</span>
+              <div className="col-span-full min-h-44 flex flex-col items-center justify-center border border-dashed border-[#1e2025] rounded-xl text-gray-500 px-4 text-center">
+                <ShieldAlert className={`w-8 h-8 mb-3 opacity-70 ${statusTone}`} />
+                <span className={`text-xs uppercase tracking-widest font-bold ${statusTone}`}>
+                  {connectionStatus === "live" ? "No executable vectors" : "Opportunity API disconnected"}
+                </span>
+                <span className="text-[10px] mt-2 max-w-2xl leading-relaxed">
+                  {statusText}
+                </span>
+                {connectionStatus === "live" && (
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mt-4 w-full max-w-2xl text-[9px] uppercase tracking-wider">
+                    <div className="border border-[#1e2025] bg-black/30 rounded px-2 py-2">
+                      <span className="block text-gray-600">Ready Pools</span>
+                      <span className="text-cyan-300 font-bold">{discovery.ready_pools ?? 0}</span>
+                    </div>
+                    <div className="border border-[#1e2025] bg-black/30 rounded px-2 py-2">
+                      <span className="block text-gray-600">Total Pools</span>
+                      <span className="text-cyan-300 font-bold">{discovery.total_pools ?? 0}</span>
+                    </div>
+                    <div className="border border-[#1e2025] bg-black/30 rounded px-2 py-2">
+                      <span className="block text-gray-600">Cached Spreads</span>
+                      <span className="text-cyan-300 font-bold">{discovery.cached_spreads ?? 0}</span>
+                    </div>
+                    <div className="border border-[#1e2025] bg-black/30 rounded px-2 py-2">
+                      <span className="block text-gray-600">Reason</span>
+                      <span className="text-yellow-300 font-bold normal-case tracking-normal">{discovery.summary || "No executable spread passed gates"}</span>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>

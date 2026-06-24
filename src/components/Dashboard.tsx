@@ -1396,7 +1396,11 @@ export default function Dashboard() {
         {/* Hyper Immersive 2.0 View */}
         {layout.hyper && (
           <div className="w-full relative z-20 mb-2 shrink-0">
-            <HyperImmersiveOpportunities opportunities={opportunities} />
+            <HyperImmersiveOpportunities
+              opportunities={opportunities}
+              diagnostics={oppDiagnostics}
+              connectionStatus={connectionStatus}
+            />
           </div>
         )}
 
