@@ -12,7 +12,7 @@ import ApexOmegaBootstrap, {
   formatCycleResults,
   CycleResults,
   ExecutionCycle,
-} from "./server/engine/SystemBootstrap.js";
+} from "../server/engine/SystemBootstrap.js";
 
 const RPC_URL =
   process.env.POLYGON_RPC_URL ||
@@ -48,7 +48,7 @@ async function validateChain(): Promise<boolean> {
     const provider = new ethers.JsonRpcProvider(RPC_URL);
     const network = await provider.getNetwork();
 
-    if (network.chainId !== 137) {
+    if (network.chainId !== 137n) {
       console.error(
         `[ERROR] Invalid chain. Expected 137 (Polygon), got ${network.chainId}`
       );
@@ -56,7 +56,7 @@ async function validateChain(): Promise<boolean> {
     }
 
     const blockNumber = await provider.getBlockNumber();
-    const gasPrice = await provider.getGasPrice();
+    const gasPrice = await provider.getFeeData().then((fee) => fee.gasPrice || 0n);
 
     console.log(`✓ Chain 137 verified`);
     console.log(`  Block: ${blockNumber}`);
