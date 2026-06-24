@@ -1,324 +1,130 @@
 #!/usr/bin/env tsx
 
-/**
- * APEX OMEGA: LIVE 5-CYCLE EXECUTION
- * ==================================
- * Real chain 137 data, actual RPC calls, genuine MEV discovery
- * No mocked data - all values from blockchain
- */
-
+import "dotenv/config";
+import { spawn } from "node:child_process";
 import { ethers } from "ethers";
-import ApexOmegaBootstrap, {
-  formatCycleResults,
-  CycleResults,
-  ExecutionCycle,
-} from "./server/engine/SystemBootstrap.js";
 
+const CHAIN_ID = 137n;
+const DEFAULT_CYCLE_COUNT = 5;
+const DEFAULT_CYCLE_TIMEOUT_MS = 180_000;
+const API_BASE = process.env.APEX_API_BASE || "http://127.0.0.1:3000";
 const RPC_URL =
   process.env.POLYGON_RPC_URL ||
   process.env.POLYGON_RPC ||
-  "https://rpc.ankr.com/polygon";
-const EXECUTOR_PRIVATE_KEY = process.env.EXECUTOR_PRIVATE_KEY;
-const C1_TARGET_CONTRACT =
-  process.env.C1_ARB_EXECUTOR_ADDRESS ||
-  process.env.C1_TARGET ||
-  process.env.ARB_CONTRACT_ADDRESS;
-const FLASHLOAN_ASSET =
-  process.env.FLASHLOAN_ASSET || "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+  process.env.RPC_URL ||
+  "https://polygon-rpc.com";
 
-// Live price fetching for MATIC
-async function fetchMaticPrice(): Promise<number> {
-  try {
-    const response = await fetch(
-      "https://api.coingecko.com/api/v3/simple/price?ids=matic-network&vs_currencies=usd"
-    );
-    const data = await response.json();
-    return data["matic-network"]?.usd || 0.72;
-  } catch (error) {
-    console.warn(
-      "[WARNING] Could not fetch MATIC price from CoinGecko, using default"
-    );
-    return 0.72;
-  }
+function intEnv(name: string, fallback: number) {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
-// Validate RPC connectivity and chain ID
-async function validateChain(): Promise<boolean> {
-  try {
-    const provider = new ethers.JsonRpcProvider(RPC_URL);
-    const network = await provider.getNetwork();
-
-    if (network.chainId !== 137) {
-      console.error(
-        `[ERROR] Invalid chain. Expected 137 (Polygon), got ${network.chainId}`
-      );
-      return false;
-    }
-
-    const blockNumber = await provider.getBlockNumber();
-    const gasPrice = await provider.getGasPrice();
-
-    console.log(`✓ Chain 137 verified`);
-    console.log(`  Block: ${blockNumber}`);
-    console.log(`  Gas Price: ${(Number(gasPrice) / 1e9).toFixed(2)} Gwei`);
-
-    return true;
-  } catch (error: any) {
-    console.error("[ERROR] Chain validation failed:", error?.message);
-    return false;
+async function getJson(path: string) {
+  const response = await fetch(`${API_BASE}${path}`);
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`${path} HTTP ${response.status}: ${text.slice(0, 240)}`);
   }
+  return text ? JSON.parse(text) : {};
 }
 
-// Validate executor contract exists on-chain
-async function validateExecutorContract(contractAddress: string): Promise<boolean> {
-  try {
-    if (!contractAddress || contractAddress === "0x0000000000000000000000000000000000000000") {
-      console.warn(
-        "[WARNING] No executor contract address provided. Running in simulation mode."
-      );
-      return true;
-    }
-
-    const provider = new ethers.JsonRpcProvider(RPC_URL);
-    const code = await provider.getCode(contractAddress);
-
-    if (code === "0x") {
-      console.warn(
-        `[WARNING] Executor contract ${contractAddress} not found on-chain`
-      );
-      return false;
-    }
-
-    console.log(`✓ Executor contract verified: ${contractAddress.slice(0, 10)}...`);
-    return true;
-  } catch (error: any) {
-    console.error(
-      "[ERROR] Executor validation failed:",
-      error?.message
-    );
-    return false;
+async function validateChain() {
+  const provider = new ethers.JsonRpcProvider(RPC_URL, Number(CHAIN_ID), {
+    staticNetwork: true,
+  });
+  const [network, blockNumber, feeData] = await Promise.all([
+    provider.getNetwork(),
+    provider.getBlockNumber(),
+    provider.getFeeData(),
+  ]);
+  if (network.chainId !== CHAIN_ID) {
+    throw new Error(`CHAIN_ID_MISMATCH:${network.chainId}`);
   }
+  const gasPrice = feeData.gasPrice || 0n;
+  console.log(
+    `LIVE_5_PRECHECK|chainId=${network.chainId}|block=${blockNumber}|gasGwei=${ethers.formatUnits(gasPrice, "gwei")}|api=${API_BASE}`
+  );
 }
 
-// Validate flashloan asset exists
-async function validateFlashloanAsset(assetAddress: string): Promise<boolean> {
-  try {
-    const provider = new ethers.JsonRpcProvider(RPC_URL);
-    
-    // Check if contract exists
-    const code = await provider.getCode(assetAddress);
-    if (code === "0x") {
-      console.error(`[ERROR] Flashloan asset ${assetAddress} not found on-chain`);
-      return false;
-    }
+function runCycle(cycleNumber: number): Promise<number> {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const timeoutMs = intEnv("LIVE_5_CYCLE_TIMEOUT_MS", DEFAULT_CYCLE_TIMEOUT_MS);
+    let settled = false;
+    const finish = (code: number, status: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const durationMs = Date.now() - started;
+      console.log(
+        `LIVE_5_CYCLE_END|cycle=${cycleNumber}|exitCode=${code}|status=${status}|durationMs=${durationMs}`
+      );
+      resolve(code);
+    };
+    const child = spawn(process.execPath, ["node_modules/tsx/dist/cli.mjs", "scripts/live-cycle.ts"], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        LIVE_ROUTE_PRINT_LIMIT:
+          process.env.LIVE_ROUTE_PRINT_LIMIT || process.env.LIVE_5_ROUTE_PRINT_LIMIT || "20",
+      },
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const timer = setTimeout(() => {
+      console.error(`LIVE_5_CYCLE_TIMEOUT|cycle=${cycleNumber}|timeoutMs=${timeoutMs}`);
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
+      finish(124, "TIMEOUT");
+    }, timeoutMs);
 
-    // Try to read decimals
-    const ERC20_ABI = [
-      "function decimals() view returns (uint8)",
-      "function symbol() view returns (string)",
-      "function name() view returns (string)",
-    ];
+    console.log(`LIVE_5_CYCLE_BEGIN|cycle=${cycleNumber}`);
 
-    const contract = new ethers.Contract(assetAddress, ERC20_ABI, provider);
-    const [decimals, symbol, name] = await Promise.all([
-      contract.decimals().catch(() => 18),
-      contract.symbol().catch(() => "UNKNOWN"),
-      contract.name().catch(() => "UNKNOWN"),
-    ]);
-
-    console.log(
-      `✓ Flashloan asset verified: ${symbol} (${name}) - ${decimals} decimals`
-    );
-    return true;
-  } catch (error: any) {
-    console.error("[ERROR] Flashloan asset validation failed:", error?.message);
-    return false;
-  }
+    child.stdout.on("data", (chunk: Buffer) => {
+      process.stdout.write(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      process.stderr.write(chunk);
+    });
+    child.on("close", (code) => {
+      finish(code ?? 1, code === 0 ? "COMPLETE" : "FAILED");
+    });
+    child.on("error", (error) => {
+      console.error(`LIVE_5_CYCLE_FAILED|cycle=${cycleNumber}|error=${error.message}`);
+      finish(1, "FAILED");
+    });
+  });
 }
 
 async function main() {
-  console.log("\n" + "▼".repeat(80));
-  console.log("APEX OMEGA: LIVE 5-CYCLE EXECUTION (REAL DATA)");
-  console.log("▼".repeat(80) + "\n");
-
-  console.log("[INIT] Configuration Check");
-  console.log(`  RPC URL: ${RPC_URL}`);
+  const cycleCount = intEnv("LIVE_5_CYCLE_COUNT", DEFAULT_CYCLE_COUNT);
   console.log(
-    `  Executor Signer: ${EXECUTOR_PRIVATE_KEY ? "✓ LOADED" : "✗ MISSING (DRY_RUN MODE)"}`
+    `LIVE_5_START|cycles=${cycleCount}|engine=scripts/live-cycle.ts|mockDataAllowed=false|broadcastPolicy=ONLY_AFTER_PROFIT_AND_FORK_PASS`
   );
-  console.log(`  C1 Target: ${C1_TARGET_CONTRACT || "NOT PROVIDED"}`);
-  console.log(`  Flashloan Asset: ${FLASHLOAN_ASSET}`);
-  console.log("");
 
-  // Pre-flight checks
-  console.log("[PRE-FLIGHT] Chain Validation");
-  const chainValid = await validateChain();
-  if (!chainValid) {
-    console.error("[FATAL] Chain validation failed");
-    process.exit(1);
+  await validateChain();
+  const [health, readiness, opportunities] = await Promise.all([
+    getJson("/api/system/healthz").catch((error) => ({ error: error.message })),
+    getJson("/api/system/readiness").catch((error) => ({ error: error.message })),
+    getJson("/api/execution/opportunities").catch((error) => ({ error: error.message })),
+  ]);
+  console.log(
+    `LIVE_5_API_PRECHECK|health=${health.status || health.success || health.error}|readiness=${readiness.status || readiness.ready || readiness.error}|opportunities=${opportunities.opportunities?.length ?? "UNKNOWN"}|source=${opportunities.source || "UNKNOWN"}`
+  );
+
+  let failures = 0;
+  for (let index = 1; index <= cycleCount; index += 1) {
+    const exitCode = await runCycle(index);
+    if (exitCode !== 0) failures += 1;
   }
 
-  console.log("");
-  console.log("[PRE-FLIGHT] Flashloan Asset Validation");
-  const assetValid = await validateFlashloanAsset(FLASHLOAN_ASSET);
-  if (!assetValid) {
-    console.error("[FATAL] Flashloan asset validation failed");
-    process.exit(1);
-  }
-
-  if (C1_TARGET_CONTRACT) {
-    console.log("");
-    console.log("[PRE-FLIGHT] Executor Contract Validation");
-    await validateExecutorContract(C1_TARGET_CONTRACT);
-  }
-
-  // Fetch live MATIC price
-  console.log("");
-  console.log("[INIT] Fetching live MATIC price...");
-  const maticPrice = await fetchMaticPrice();
-  console.log(`  MATIC Price: $${maticPrice.toFixed(4)}`);
-
-  console.log("\n" + "─".repeat(80) + "\n");
-
-  try {
-    // Initialize bootstrap engine with REAL data
-    const bootstrap = new ApexOmegaBootstrap(
-      RPC_URL,
-      C1_TARGET_CONTRACT || "0x0000000000000000000000000000000000000000",
-      FLASHLOAN_ASSET,
-      EXECUTOR_PRIVATE_KEY,
-      maticPrice
-    );
-
-    console.log("[BOOTSTRAP] Initializing MEV discovery engine...\n");
-
-    // Run 5 LIVE cycles with real chain data
-    const results = await bootstrap.runMultipleCycles(
-      5, // 5 cycles
-      100, // scan 100 token pairs (real liquidity)
-      10 // minimum $10 profit threshold
-    );
-
-    // Display formatted results
-    const formattedResults = formatCycleResults(results);
-    console.log(formattedResults);
-
-    // Detailed breakdown
-    console.log("\n" + "=".repeat(80));
-    console.log("DETAILED BREAKDOWN");
-    console.log("=".repeat(80) + "\n");
-
-    for (const cycle of results.cycles) {
-      console.log(
-        `CYCLE ${cycle.cycleId}: ${cycle.status} (${cycle.duration_ms}ms)`
-      );
-
-      if (cycle.discoveredRoutes.length > 0) {
-        console.log(
-          `  Discovered Routes: ${cycle.discoveredRoutes.length}`
-        );
-        console.log(
-          `  Top 3 Routes by Profit:`
-        );
-
-        for (
-          let i = 0;
-          i < Math.min(3, cycle.discoveredRoutes.length);
-          i++
-        ) {
-          const route = cycle.discoveredRoutes[i];
-          console.log(
-            `    ${i + 1}. ${route.routeId}`
-          );
-          console.log(
-            `       Tokens: ${route.legs.map((l) => `${l.venueName}`).join(" → ")}`
-          );
-          console.log(
-            `       Profit: $${route.netProfitUSD.toFixed(2)} (Net: ${route.netProfit.toFixed(6)} tokens)`
-          );
-          console.log(
-            `       Fees: ${route.totalFees.toFixed(6)} tokens + ${route.gasCostUSD.toFixed(2)} USD gas`
-          );
-        }
-      }
-
-      if (cycle.selectedRoute) {
-        console.log(
-          `  Selected Route: ${cycle.selectedRoute.routeId}`
-        );
-        console.log(
-          `    Expected Profit: $${cycle.selectedRoute.netProfitUSD.toFixed(2)}`
-        );
-        console.log(
-          `    Input: ${(Number(cycle.selectedRoute.inputAmount) / 10 ** cycle.selectedRoute.legs[0].tokenIn.length).toFixed(6)}`
-        );
-
-        if (cycle.txHash) {
-          console.log(`    Tx: https://polygonscan.com/tx/${cycle.txHash}`);
-        }
-      }
-
-      if (cycle.error) {
-        console.log(`  Error: ${cycle.error}`);
-      }
-
-      console.log("");
-    }
-
-    // Summary statistics
-    console.log("\n" + "=".repeat(80));
-    console.log("EXECUTION SUMMARY");
-    console.log("=".repeat(80) + "\n");
-
-    const successRate =
-      ((results.summary.successfulCycles / results.summary.totalCycles) * 100).toFixed(
-        1
-      );
-    const totalProfit = results.summary.totalNetProfitUSD;
-    const avgProfit = results.summary.averageProfit;
-
-    console.log(
-      `Total Cycles: ${results.summary.totalCycles}`
-    );
-    console.log(
-      `Success Rate: ${successRate}%`
-    );
-    console.log(
-      `Total Gross Profit: ${results.summary.totalGrossProfit.toFixed(6)} tokens`
-    );
-    console.log(
-      `Total Net Profit: $${totalProfit.toFixed(2)} USD`
-    );
-    console.log(
-      `Average Profit/Cycle: $${avgProfit.toFixed(2)} USD`
-    );
-    console.log(
-      `Total Execution Time: ${results.summary.totalDuration_ms}ms`
-    );
-    console.log(
-      `Average Cycle Time: ${Math.floor(results.summary.totalDuration_ms / results.summary.totalCycles)}ms`
-    );
-
-    console.log("\n" + "=".repeat(80) + "\n");
-
-    // Exit status
-    if (results.summary.successfulCycles > 0) {
-      console.log("[SUCCESS] Live execution completed with profitable routes\n");
-      process.exit(0);
-    } else {
-      console.log(
-        "[NOTICE] No profitable routes discovered in 5 cycles (market conditions)\n"
-      );
-      process.exit(0);
-    }
-  } catch (error: any) {
-    console.error("\n[FATAL ERROR] Execution failed:");
-    console.error(error?.message || String(error));
-    if (error?.stack) {
-      console.error(error.stack);
-    }
-    process.exit(1);
-  }
+  console.log(
+    `LIVE_5_END|cycles=${cycleCount}|failures=${failures}|status=${failures === 0 ? "COMPLETE" : "FAILED"}|pnlUpdated=false_unless_verified_hash_reported_by_cycle`
+  );
+  if (failures > 0) process.exit(1);
 }
 
-main();
+main().catch((error) => {
+  console.error(`LIVE_5_FAILED|error=${error?.message || error}|pnlUpdated=false`);
+  process.exit(1);
+});

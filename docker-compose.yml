@@ -1,6 +1,23 @@
 name: apex-omega
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: apex-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "1", "1"]
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks:
+      - apex-net
+
   anvil-fork:
     image: ghcr.io/foundry-rs/foundry:latest
     container_name: apex-anvil-fork
@@ -35,6 +52,8 @@ services:
     container_name: apex-omega-api
     restart: unless-stopped
     depends_on:
+      redis:
+        condition: service_healthy
       anvil-fork:
         condition: service_healthy
     ports:
@@ -49,6 +68,8 @@ services:
       REQUIRE_CHAIN_ID_MATCH: ${REQUIRE_CHAIN_ID_MATCH:-true}
       RPC_REQUIRE_CHAIN_ID: ${RPC_REQUIRE_CHAIN_ID:-137}
       FORK_SIM_RPC_URL: http://anvil-fork:8545
+      REDIS_URL: redis://redis:6379
+      REDIS_ENABLED: ${REDIS_ENABLED:-true}
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval: 30s
@@ -80,3 +101,4 @@ networks:
 
 volumes:
   bor-data:
+  redis-data:

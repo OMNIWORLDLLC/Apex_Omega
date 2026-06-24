@@ -7,6 +7,12 @@ import { ethers } from "ethers";
 import { WebSocketServer } from "ws";
 import { DeFiExecutorManager } from "./ExecutionManager.js";
 import { InvariantMath } from "./server/engine/invariants.js";
+import {
+  getActiveLedgerOpportunities,
+  getRedisLedgerStatus,
+  publishOpportunitySnapshot,
+  releaseOpportunityLock,
+} from "./server/redisLedger.js";
 
 const CONFIG_PATH = path.join(process.cwd(), "config.json");
 
@@ -857,7 +863,10 @@ async function startServer() {
 
   let latestOpportunities: any[] = [];
 
-  const getActiveOpportunities = () => latestOpportunities;
+  const getActiveOpportunities = async () => {
+    const ledgerRows = await getActiveLedgerOpportunities().catch(() => null);
+    return ledgerRows ?? latestOpportunities;
+  };
 
   const recordVerifiedOnChainPnl = (rawAmount: bigint, decimals: number) => {
     if (rawAmount <= 0n) return;
@@ -883,6 +892,20 @@ async function startServer() {
       context: instance.seed.context,
     },
   });
+
+  const c2ListenerEnabled = process.env.C2_LISTENER_ENABLED !== "false";
+  let lastC2ListenerBlock = 0;
+  let isC2ListenerRunning = false;
+
+  const appendC2DecisionIfMissing = (
+    instance: C2Instance,
+    blockNumber: number,
+    decision: C2DecisionRecord,
+  ) => {
+    if (instance.decisions.some((item) => item.blockNumber === blockNumber)) return false;
+    instance.decisions.push(decision);
+    return true;
+  };
 
   const initializeC2InstanceFromC1 = async (hash: string, receipt: any, pending: any) => {
     if (pending.payloadKind !== "FLASHLOAN_INTEGRATED_C1_PAYLOADS") return null;
@@ -930,6 +953,62 @@ async function startServer() {
     return instance;
   };
 
+  const runC2BlockListener = async (currentBlock: number) => {
+    if (!c2ListenerEnabled || isC2ListenerRunning || currentBlock <= 0 || currentBlock === lastC2ListenerBlock) return;
+    isC2ListenerRunning = true;
+    try {
+      lastC2ListenerBlock = currentBlock;
+      for (const instance of c2Instances.values()) {
+        if (instance.status !== "PENDING") continue;
+        if (currentBlock < instance.firstEligibleBlock) continue;
+
+        if (currentBlock > instance.expiresAfterBlock) {
+          instance.status = "EXPIRED";
+          instance.finalDecision = "EXPIRED";
+          const added = appendC2DecisionIfMissing(instance, currentBlock, {
+            blockNumber: currentBlock,
+            decision: "EXPIRED",
+            createdAt: Date.now(),
+            routeEvaluation: {
+              listener: "C2_BLOCK_LISTENER",
+              gate: "C2_WINDOW_EXPIRED",
+              window: `${instance.firstEligibleBlock}-${instance.expiresAfterBlock}`,
+              txCreated: false,
+            },
+          });
+          if (added) {
+            bumpStage("C2_ACTION");
+            systemLogQueue.push({ tag: "C2", message: `C2 LISTENER EXPIRED: C1 ${instance.c1HashLink}; current block ${currentBlock}; no tx hash created.` });
+          }
+          continue;
+        }
+
+        bumpStage("C2_RECOMPUTE_FROM_PAIRED_C1");
+        const added = appendC2DecisionIfMissing(instance, currentBlock, {
+          blockNumber: currentBlock,
+          decision: "DO_NOTHING",
+          createdAt: Date.now(),
+          routeEvaluation: {
+            listener: "C2_BLOCK_LISTENER",
+            gate: "NO_EXECUTABLE_MIRROR_OR_REVERSE_SIGNAL",
+            reason: "C2 listener is block-driven and will not fabricate a mirror/reverse payload without explicit executable route revalidation.",
+            txCreated: false,
+          },
+        });
+        if (added) {
+          if (currentBlock >= instance.expiresAfterBlock) {
+            instance.status = "EXPIRED";
+            instance.finalDecision = "EXPIRED";
+          }
+          bumpStage("C2_ACTION");
+          systemLogQueue.push({ tag: "C2", message: `C2 LISTENER DO_NOTHING: C1 ${instance.c1HashLink} evaluated at block ${currentBlock}; no tx hash created.` });
+        }
+      }
+    } finally {
+      isC2ListenerRunning = false;
+    }
+  };
+
   const bumpStage = (name: string, amount: number = 1) => {
     const stage = pipelineStages.find((item) => item.name === name);
     if (stage) stage.count += amount;
@@ -951,6 +1030,7 @@ async function startServer() {
       const liveBlock = await queryPolygonRPC("eth_blockNumber", []);
       if (liveBlock) {
         liveBlockNumber = parseInt(liveBlock, 16);
+        await runC2BlockListener(liveBlockNumber);
       }
 
       gasGwei = await fetchGasGwei();
@@ -1012,6 +1092,7 @@ async function startServer() {
       paused: isEnginePaused,
       dryRun: isDryRun,
       status: isEnginePaused ? "PAUSED" : "OPERATIONAL",
+      redisLedger: getRedisLedgerStatus(),
     });
   });
 
@@ -1172,6 +1253,11 @@ async function startServer() {
         lifespan: "C1_BLOCK_PLUS_1_THROUGH_C1_BLOCK_PLUS_5",
         decisions: ["DO_NOTHING", "MIRROR", "REVERSE"],
         hashRule: "ONLY_MIRROR_OR_REVERSE_CAN_CREATE_C2_HASH",
+        listener: {
+          enabled: c2ListenerEnabled,
+          lastBlock: lastC2ListenerBlock,
+          mode: "BLOCK_DRIVEN_PENDING_C1_WINDOW_ONLY",
+        },
       },
 
       // Reserve Cache data merged for easier consumption
@@ -1195,12 +1281,14 @@ async function startServer() {
   });
 
   // Dual Spread Opportunity feeds
-  app.get("/api/execution/opportunities", (req, res) => {
+  app.get("/api/execution/opportunities", async (req, res) => {
+    const activeOpportunities = await getActiveOpportunities();
     res.json({
-      opportunities: getActiveOpportunities(),
+      opportunities: activeOpportunities,
       source: "live",
+      redisLedger: getRedisLedgerStatus(),
       diagnostics: {
-        summary: latestOpportunities.length ? "Live arbitrage scanner found executable spread candidates." : "No live executable spreads observed.",
+        summary: activeOpportunities.length ? "Live arbitrage scanner found executable spread candidates." : "No live executable spreads observed.",
         profit_gate: { blocked_count: 0 },
         gas_gate: { blocked_count: 0 },
         slippage_gate: { blocked_count: 0 },
@@ -1208,15 +1296,15 @@ async function startServer() {
           ready_pools: reservePoolsCount,
           total_pools: pools.length,
           scanable_pairs: pools.length,
-          cached_spreads: latestOpportunities.length,
+          cached_spreads: activeOpportunities.length,
           summary: reservePoolsCount > 0 ? "Live reserves polled successfully" : "Awaiting live reserve sync",
         },
       },
     });
   });
 
-  app.get("/api/dashboard/opportunities", (req, res) => {
-    res.json(getActiveOpportunities());
+  app.get("/api/dashboard/opportunities", async (req, res) => {
+    res.json(await getActiveOpportunities());
   });
 
   // 32-Lane Executor Status
@@ -1274,6 +1362,7 @@ async function startServer() {
       const flashloanAsset = req.body.flashloanAsset;
       const flashloanAmount = req.body.flashloanAmount;
       const context = req.body.context;
+      const redisId = typeof req.body.redisId === "string" ? req.body.redisId : "";
 
       if (!targetContract || !flashloanAsset || !flashloanAmount || !context) {
         return res.status(400).json({
@@ -1311,7 +1400,19 @@ async function startServer() {
             },
           });
           systemLogQueue.push({ tag: "C1", message: `HASH PRINTED: ${result.hashLink || getExplorerTxLink(result.hash)} | P&L locked pending AI/on-chain verification for ${profitReceiver}` });
+          if (redisId) {
+            await releaseOpportunityLock(redisId, "C1_PENDING", {
+              txHash: result.hash,
+              txHashLink: result.hashLink || getExplorerTxLink(result.hash),
+              payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
+            });
+          }
         }
+      } else if (redisId) {
+        await releaseOpportunityLock(redisId, "C1_REJECTED", {
+          error: result.error || "C1 execution rejected",
+          payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
+        });
       }
 
       res.status(result.success ? 200 : 409).json(result);
@@ -1941,7 +2042,7 @@ async function startServer() {
          });
        }
 
-       latestOpportunities = newOpportunities;
+       latestOpportunities = await publishOpportunitySnapshot(newOpportunities, "proactive-arb-sweep");
        reservePoolsCount = livePoolAddresses.size;
        reserveDirtyCount = 0;
        reserveStaleCount = pools.length - livePoolAddresses.size;

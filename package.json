@@ -9,7 +9,7 @@
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit",
+    "lint": "node --max-old-space-size=4096 ./node_modules/typescript/bin/tsc --noEmit",
     "test:contract-sync": "tsx scripts/contract-sync-test.ts",
     "test:signing-hash": "tsx scripts/signing-hash-test.ts",
     "test:broadcast": "tsx scripts/broadcast-test.ts",
@@ -34,6 +34,7 @@
     "react-dom": "^19.0.1",
     "react-markdown": "^10.1.0",
     "recharts": "^3.8.1",
+    "redis": "^6.0.1",
     "vite": "^6.2.3",
     "ws": "^8.21.0"
   },
