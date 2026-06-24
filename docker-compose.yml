@@ -1,0 +1,82 @@
+name: apex-omega
+
+services:
+  anvil-fork:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: apex-anvil-fork
+    restart: unless-stopped
+    init: true
+    command:
+      - anvil
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8545"
+      - --chain-id
+      - "137"
+      - --fork-url
+      - ${FORK_UPSTREAM_RPC_URL:?set FORK_UPSTREAM_RPC_URL to a low-latency Polygon RPC}
+    ports:
+      - "${ANVIL_HOST_PORT:-8545}:8545"
+    healthcheck:
+      test: ["CMD-SHELL", "cast chain-id --rpc-url http://127.0.0.1:8545 | grep -q 137"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    networks:
+      - apex-net
+
+  apex-omega:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: apex-omega:${APEX_IMAGE_TAG:-local}
+    container_name: apex-omega-api
+    restart: unless-stopped
+    depends_on:
+      anvil-fork:
+        condition: service_healthy
+    ports:
+      - "${APEX_HOST_PORT:-3000}:3000"
+    env_file:
+      - ${APEX_ENV_FILE:-.env.cloud.example}
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      SHADOW_MODE: ${SHADOW_MODE:-true}
+      LIVE_EXECUTION: ${LIVE_EXECUTION:-false}
+      REQUIRE_CHAIN_ID_MATCH: ${REQUIRE_CHAIN_ID_MATCH:-true}
+      RPC_REQUIRE_CHAIN_ID: ${RPC_REQUIRE_CHAIN_ID:-137}
+      FORK_SIM_RPC_URL: http://anvil-fork:8545
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    networks:
+      - apex-net
+
+  bor-rpc:
+    profiles: ["bor"]
+    build:
+      context: .
+      dockerfile: docker/bor/Dockerfile
+      args:
+        BOR_REF: ${BOR_REF:-v2.8.3}
+    image: apex-bor:${BOR_REF:-v2.8.3}
+    container_name: apex-bor-rpc
+    restart: unless-stopped
+    command: ["bor", "version"]
+    volumes:
+      - bor-data:/var/lib/bor
+    networks:
+      - apex-net
+
+networks:
+  apex-net:
+    driver: bridge
+
+volumes:
+  bor-data:

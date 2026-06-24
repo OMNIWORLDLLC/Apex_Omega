@@ -1,0 +1,13 @@
+node_modules
+dist
+build
+.git
+.env
+.env.*
+!.env.example
+npm-debug.log
+yarn-error.log
+*.log
+!.env.cloud.example
+config.json
+config.json.bak
