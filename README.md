@@ -174,6 +174,26 @@ Dynamic route cycle:
 npm run live:cycle
 ```
 
+Default live discovery prioritizes advanced venues: Uniswap V3, Retro V3, QuickSwap Algebra, Curve, and Balancer. V2-compatible venues are an explicit fallback lane and are disabled unless `LIVE_DISCOVERY_ENABLE_V2=true`.
+
+Standalone transaction builder / encoder / signer:
+
+```powershell
+# Build and encode only. Does not sign or submit.
+npm run tx:one -- scripts/tx-one.raw.example.json no-sign
+
+# Build, encode, ABI-decode, and fork-simulate. Does not sign or submit.
+npm run tx:one -- path\to\payload.json simulate out=tx-result.json
+
+# Optional signed artifact without submission. Use only when you explicitly need the raw signed tx hash.
+npm run tx:one -- path\to\payload.json simulate sign out=tx-result.json
+
+# Live submit. Requires live env gates plus exact fork simulation pass.
+npm run tx:one -- path\to\payload.json submit ack=I_ACCEPT_LIVE_TX
+```
+
+Payload templates live under `scripts/tx-one.*.example.json` for raw calldata, C1, C2, and liquidation envelopes. Simulation uses the same encoded calldata as submission, records an ABI decode check, and does not sign by default. The submitter is fail-closed: it requires `LIVE_EXECUTION=true`, `SHADOW_MODE=false`, `TX_ONE_ACK=I_ACCEPT_LIVE_TX`, a signer key, Polygon RPC, and `FORK_SIM_RPC_URL`. Signed raw transaction bytes are hidden unless `include-raw` or `TX_ONE_INCLUDE_RAW=true` is set.
+
 For performance diagnostics only, explicit environment bounds can be used. Bounded runs are not full-runtime proof:
 
 ```powershell

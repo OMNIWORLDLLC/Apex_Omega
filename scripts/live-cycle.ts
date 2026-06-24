@@ -1,12 +1,9 @@
 import "dotenv/config";
+import fs from "fs";
+import path from "path";
 import { ethers } from "ethers";
 import {
-  buildAlgebraExactInputSingleCalldata,
-  buildBalancerSingleSwapCalldata,
-  buildCurveRouterExchangeCalldata,
-  buildStableSwapExchangeCalldata,
-  buildV2SwapCalldata,
-  buildV3ExactInputSingleCalldata,
+  buildRouteCalldataFromQuote,
   preSendRevalidate,
   quoteAlgebraExactInputSingle,
   quoteBalancerWeighted,
@@ -19,10 +16,12 @@ import {
   ROUTE_ADAPTER_TARGETS,
 } from "../server/engine/routeAdapters.js";
 import {
+  flushLaneEventBatch,
   lockOpportunityForExecution,
   publishOpportunitySnapshot,
   recordLaneEvent,
   releaseOpportunityLock,
+  routeKeyFromC1Payload,
 } from "../server/redisLedger.js";
 
 const CHAIN_ID = 137n;
@@ -41,7 +40,7 @@ const DEFAULT_ROUTE_MAX_STATE_AGE_BLOCKS = 128;
 const DEFAULT_TOP_ROUTE_DISPLAY_LIMIT = 50;
 const DEFAULT_C1_EXECUTABLE_LIMIT = 10;
 const AAVE_V3_POOL = process.env.AAVE_V3_POOL_ADDRESS || "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
-const DEFAULT_C1_TARGET = process.env.C1_CONTRACT_ADDRESS || process.env.CONTRACT_ADDRESS || process.env.EXECUTOR_ADDRESS || "";
+const DEFAULT_C1_TARGET = process.env.C1_CONTRACT_ADDRESS || process.env.C1_TARGET || process.env.APEX_C1_TARGET || process.env.CONTRACT_ADDRESS || process.env.EXECUTOR_ADDRESS || "";
 const ZERO_ADDRESS = ethers.ZeroAddress;
 
 const AAVE_POOL_ABI = [
@@ -102,6 +101,41 @@ const BALANCER_WEIGHTED_POOL_ABI = [
 const VM_ABI = [
   "function globalNonce() view returns (uint256)",
 ];
+const MULTICALL3_ABI = [
+  "function aggregate3(tuple(address target,bool allowFailure,bytes callData)[] calls) view returns (tuple(bool success,bytes returnData)[] returnData)",
+];
+const DEFAULT_MULTICALL3_ADDRESS = "0xca11bde05977b3631167028862be2a173976ca11";
+
+const DEFAULT_DISCOVERY_FORCE_TOKENS: Record<string, string> = {
+  USDC_E: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+  USDC: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+  USDT0: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
+  USDT: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
+  DAI: "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063",
+  WETH: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619",
+  WBTC: "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6",
+  WPOL: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270",
+  WMATIC: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270",
+  FRAX: "0x45c32fA6DF82ead1e2EF74d17b76547EDdFaFF89",
+  MAI: "0xa3Fa99A148fA48D14Ed51d610c367C61876997F1",
+  MIMATIC: "0xa3Fa99A148fA48D14Ed51d610c367C61876997F1",
+  STMATIC: "0x3A58a54C066FdC0f2D55FC9C89F0415C92eBf3C4",
+  MATICX: "0xfa68FB4628DFF1028CFEc22b4162FCcd0d45efb6",
+  AAVE: "0xD6DF932A45C0f255f85145f286eA0b292B21C90B",
+  LINK: "0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39",
+  CRV: "0x172370d5Cd63279eFa6d502DAB29171933a610AF",
+  BAL: "0x9a71012B13CA4d3D0Cdc72A177DF3ef03b0E76A3",
+  QUICK: "0x831753DD7087CaC61aB5644b308642cc1c33Dc13",
+  MANA: "0xA1c57f48F0Deb89f569dFbE6E2B7f46D33606fD4",
+  SUSHI: "0x0b3F868E0BE5597D5DB7fEB59E1CADBb0fdDa50a",
+  GHST: "0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7",
+  SAND: "0xBbba073C31bF03b8ACf7c28EF0738DeCF3695683",
+  GRT: "0x5fe2B58c013d7601147DcdD68C143A77499f5531",
+  UNI: "0xb33EaAd8d922B1083446DC23f610c2567fB5180f",
+  GNS: "0xE5417Af564e4bFDA1c483642db72007871397896",
+  TEL: "0xdF7837DE1F2Fa4631D716CF2502f8b230F1dcc32",
+  RNDR: "0x61299774020dA444Af134c82fa83E3810b309991",
+};
 
 type TokenMeta = {
   chainId: 137;
@@ -133,6 +167,8 @@ type Edge = PoolEdge & {
   tokenOutPriceUsd?: number;
   extra?: {
     v3Fee?: number;
+    v3Quoter?: string;
+    algebraQuoter?: string;
     curveIndexType?: "int128" | "uint256";
     balancerWeightIn?: bigint;
     balancerWeightOut?: bigint;
@@ -148,9 +184,17 @@ type RouteQuoteStep = {
   calldata: string;
 };
 
+type PreSendResult = {
+  ok: boolean;
+  error?: string;
+  currentBlock?: number;
+};
+
 type Candidate = {
   rank?: number;
   routeId: string;
+  routeOrientation?: "DIRECT" | "AUTO_REVERSE";
+  reverseOf?: string;
   status: "EXECUTABLE_PROFIT_CANDIDATE" | "REJECTED_NO_PROFIT" | "REJECTED_ROUTE_INVALID";
   flashloanAsset: TokenMeta;
   flashloanLiquidity: FlashloanLiquidity;
@@ -158,16 +202,54 @@ type Candidate = {
   steps: RouteQuoteStep[];
   amountIn: bigint;
   amountOut: bigint;
+  repaymentRaw: bigint;
+  repaymentUsd?: number;
+  requiredOutputRaw?: bigint;
+  requiredOutputUsd?: number;
+  executableSurplusRaw?: bigint;
+  executableSurplusUsd?: number;
+  economicMinTradeUsd?: number;
+  maxScannableTradeUsd?: number;
+  profitabilityTargetEdgeBps?: number;
+  economicSizeOk?: boolean;
   grossProfitRaw: bigint;
   grossProfitUsd?: number;
   gasCostUsd?: number;
   flashFeeRaw: bigint;
   flashFeeUsd?: number;
+  riskBufferUsd?: number;
+  minProfitUsd?: number;
+  requiredPremiumUsd?: number;
   netProfitUsd?: number;
   lowestPoolTvlUsd: number;
   rejectionReason: string;
   c1ExecutionEligible?: boolean;
   c1ExecutionSlot?: number;
+  sizingRule?: string;
+  sizeSearchCandidatesUsd?: number[];
+  priceVariance?: PriceVarianceGate;
+};
+
+export type LiveCycleCandidate = Candidate;
+export type LiveCycleDiscoveryStats = DiscoveryStats;
+export type LiveCyclePoolEdge = Edge;
+
+type PriceVarianceGate = {
+  ok: boolean;
+  mode: "DIRECT_TWO_LEG" | "MULTI_LEG_NET";
+  leg1BuyPrice?: number;
+  leg2SellPrice?: number;
+  priceEdgeBps?: number;
+  reverseMathHint?: {
+    buyLeg1IfReversed: number;
+    sellLeg2IfReversed: number;
+    naiveReverseEdgeBps: number;
+    naiveReverseGrossPositive: boolean;
+    warning: string;
+  };
+  grossReturnRatio: number;
+  rule: string;
+  reason: string;
 };
 
 type ReverseRouteMetadata = {
@@ -193,12 +275,21 @@ type DiscoveryStats = {
   rejectedMetadata: number;
   rejectedZeroLiquidity: number;
   rejectedUnsupportedInvariant: number;
+  rejectedLowTvlEdge: number;
   rejectedLogScan: number;
   rejectedPreSend: number;
+  preSendRejectReasons: Record<string, number>;
+  forcedDiscoveryTokens: number;
   routeCyclesEnumerated: number;
   routeCyclesRejectedRepeatedPool: number;
+  routeCyclesRejectedRepeatedToken: number;
   routeCyclesRejectedNonFlashloan: number;
+  routeCyclesRejectedVenueDiversity: number;
+  routeCyclesRejectedConsecutiveVenue: number;
+  routeCyclesRejectedTvl: number;
   routeCyclesRejectedQuote: number;
+  routeQuoteRejectReasons: Record<string, number>;
+  minRoutePoolTvlUsd: number;
   truncated: boolean;
   sourceCounts: Record<string, number>;
 };
@@ -224,11 +315,58 @@ function numberEnv(name: string, fallback: number) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function boolEnv(name: string, fallback: boolean) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  return raw === "true" || raw === "1";
+}
+
 function normalize(address: string) {
   if (/^0x[a-fA-F0-9]{40}$/.test(address)) {
     return ethers.getAddress(address.toLowerCase());
   }
   return ethers.getAddress(address);
+}
+
+function parseDiscoveryForceEntries() {
+  const configured = [
+    ...Object.keys(DEFAULT_DISCOVERY_FORCE_TOKENS),
+    ...(process.env.DISCOVERY_FORCE_SYMBOLS || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean),
+    ...(process.env.LIVE_DISCOVERY_FORCE_TOKENS || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean),
+  ];
+  return [...new Set(configured.map((item) => item.trim()).filter(Boolean))];
+}
+
+async function loadForcedDiscoveryTokens(provider: ethers.JsonRpcProvider, tokenCache: Map<string, TokenMeta>) {
+  const tokens: TokenMeta[] = [];
+  for (const entry of parseDiscoveryForceEntries()) {
+    const mapped = DEFAULT_DISCOVERY_FORCE_TOKENS[entry.toUpperCase()];
+    const rawAddress = mapped || entry;
+    try {
+      tokens.push(await loadTokenMeta(provider, tokenCache, rawAddress, false));
+    } catch {
+      // Bad symbol/address or metadata failure means the asset cannot be included in live math.
+    }
+  }
+  return Array.from(new Map(tokens.map((token) => [token.address.toLowerCase(), token])).values());
+}
+
+function mergeTokenLists(...lists: TokenMeta[][]) {
+  return Array.from(new Map(lists.flat().map((token) => [token.address.toLowerCase(), token])).values());
+}
+
+function edgeRuntimeKey(edge: Edge) {
+  return `${edge.dexId}:${edge.poolAddress}:${edge.tokenIn}:${edge.tokenOut}:${edge.invariant}:${edge.feeBps}:${edge.tokenInIndex ?? ""}:${edge.tokenOutIndex ?? ""}`.toLowerCase();
+}
+
+function preSendPoolKey(edge: Edge) {
+  return `${edge.invariant}:${edge.poolAddress}:${edge.poolId || ""}:${edge.extra?.v3Fee ?? edge.feeBps}`.toLowerCase();
 }
 
 function sameAddress(left: string, right: string) {
@@ -244,6 +382,19 @@ function floatToRaw(value: number, decimals: number) {
   const scale = 10 ** Math.min(decimals, 12);
   const truncated = Math.floor(value * scale) / scale;
   return ethers.parseUnits(truncated.toFixed(Math.min(decimals, 12)), decimals);
+}
+
+function floatToRawCeil(value: number, decimals: number) {
+  if (!Number.isFinite(value) || value <= 0) return 0n;
+  const precision = Math.min(decimals, 12);
+  const scale = 10 ** precision;
+  const roundedUp = Math.ceil(value * scale) / scale;
+  return ethers.parseUnits(roundedUp.toFixed(precision), decimals);
+}
+
+function usdToRawCeil(valueUsd: number, token: TokenMeta) {
+  if (!token.priceUsd || token.priceUsd <= 0) return undefined;
+  return floatToRawCeil(valueUsd / token.priceUsd, token.decimals);
 }
 
 function bpsMin(amount: bigint, slippageBps: bigint) {
@@ -280,10 +431,53 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
   }
 }
 
+async function withBudget<T>(
+  startedAt: number,
+  maxRuntimeMs: number,
+  label: string,
+  task: () => Promise<T>,
+): Promise<T> {
+  const remainingMs = maxRuntimeMs - (Date.now() - startedAt);
+  if (remainingMs <= 0) throw new Error(`${label}_DISCOVERY_BUDGET_EXPIRED`);
+  return await withTimeout(task(), Math.max(1, remainingMs), `${label}_DISCOVERY_BUDGET`);
+}
+
 function usdStableSeed(symbol: string) {
   const upper = symbol.toUpperCase();
-  if (upper === "USDC" || upper === "USDC.E" || upper === "USDT" || upper === "DAI") return 1;
+  if (upper === "USDC" || upper === "USDC.E" || upper === "USDT" || upper === "USDT0" || upper === "DAI" || upper === "FRAX") return 1;
+  if (upper === "MIMATIC" || upper === "MAI") return 1;
   return undefined;
+}
+
+function priceBounds(symbol: string) {
+  const upper = symbol.toUpperCase();
+  if (["USDC", "USDC.E", "USDT", "USDT0", "DAI", "FRAX", "MIMATIC", "MAI"].includes(upper)) return { min: 0.8, max: 1.2 };
+  if (["WETH", "WSTETH"].includes(upper)) return { min: 100, max: 20_000 };
+  if (upper === "WBTC") return { min: 1_000, max: 500_000 };
+  if (["WPOL", "WMATIC", "POL", "MATIC", "STMATIC", "MATICX"].includes(upper)) return { min: 0.001, max: 20 };
+  return {
+    min: numberEnv("PRICE_DERIVATION_MIN_USD", 0.000001),
+    max: numberEnv("PRICE_DERIVATION_MAX_USD", 1_000_000),
+  };
+}
+
+function priceWithinBounds(symbol: string, value: number) {
+  const bounds = priceBounds(symbol);
+  return Number.isFinite(value) && value >= bounds.min && value <= bounds.max;
+}
+
+function weightedMedian(values: Array<{ value: number; weight: number }>) {
+  const filtered = values
+    .filter((item) => Number.isFinite(item.value) && item.value > 0 && Number.isFinite(item.weight) && item.weight > 0)
+    .sort((left, right) => left.value - right.value);
+  if (filtered.length === 0) return undefined;
+  const totalWeight = filtered.reduce((sum, item) => sum + item.weight, 0);
+  let running = 0;
+  for (const item of filtered) {
+    running += item.weight;
+    if (running >= totalWeight / 2) return item.value;
+  }
+  return filtered[filtered.length - 1]?.value;
 }
 
 function quoteUsd(raw: bigint, token: TokenMeta) {
@@ -291,12 +485,119 @@ function quoteUsd(raw: bigint, token: TokenMeta) {
   return rawToFloat(raw, token.decimals) * token.priceUsd;
 }
 
+function effectivePriceUsd(amountIn: bigint, tokenIn: TokenMeta, amountOut: bigint, tokenOut: TokenMeta) {
+  const inUsd = quoteUsd(amountIn, tokenIn);
+  const outUnits = rawToFloat(amountOut, tokenOut.decimals);
+  if (inUsd === undefined || outUnits <= 0) return undefined;
+  return inUsd / outUnits;
+}
+
+function evaluatePriceVarianceGate(steps: RouteQuoteStep[], flashloanAsset: TokenMeta, grossProfitRaw: bigint): PriceVarianceGate {
+  const amountIn = steps[0]?.amountIn || 0n;
+  const amountOut = steps[steps.length - 1]?.amountOut || 0n;
+  const grossReturnRatio = amountIn > 0n ? Number(amountOut) / Number(amountIn) : 0;
+  const directTwoLeg = steps.length === 2;
+  if (directTwoLeg) {
+    const leg1 = steps[0];
+    const leg2 = steps[1];
+    const leg1TokenIn = leg1.edge.tokenInSymbol;
+    const leg1TokenOut = leg1.edge.tokenOutSymbol;
+    const leg2TokenIn = leg2.edge.tokenInSymbol;
+    const leg2TokenOut = leg2.edge.tokenOutSymbol;
+    if (leg1TokenOut === leg2TokenIn && leg1TokenIn === leg2TokenOut) {
+      const intermediate = {
+        chainId: 137 as const,
+        address: leg1.edge.tokenOut,
+        symbol: leg1.edge.tokenOutSymbol,
+        decimals: leg1.edge.tokenOutDecimals,
+        priceUsd: leg1.edge.tokenOutPriceUsd,
+        flashloanEligible: false,
+      };
+      const leg1BuyPrice = effectivePriceUsd(leg1.amountIn, flashloanAsset, leg1.amountOut, intermediate);
+      const leg2SellPrice = effectivePriceUsd(leg2.amountOut, flashloanAsset, leg2.amountIn, intermediate);
+      if (leg1BuyPrice !== undefined && leg2SellPrice !== undefined) {
+        const priceEdgeBps = leg1BuyPrice > 0 ? (leg2SellPrice - leg1BuyPrice) / leg1BuyPrice * 10_000 : 0;
+        const reverseMathHint = leg1BuyPrice >= leg2SellPrice && leg2SellPrice > 0
+          ? {
+            buyLeg1IfReversed: leg2SellPrice,
+            sellLeg2IfReversed: leg1BuyPrice,
+            naiveReverseEdgeBps: (leg1BuyPrice - leg2SellPrice) / leg2SellPrice * 10_000,
+            naiveReverseGrossPositive: leg1BuyPrice > leg2SellPrice,
+            warning: "Naive inversion ignores live re-quote, pool fees, slippage, curve impact, gas, and flash fees. AUTO_REVERSE rows are quoted independently.",
+          }
+          : undefined;
+        return {
+          ok: leg1BuyPrice < leg2SellPrice,
+          mode: "DIRECT_TWO_LEG",
+          leg1BuyPrice,
+          leg2SellPrice,
+          priceEdgeBps,
+          reverseMathHint,
+          grossReturnRatio,
+          rule: "LEG1_BUY_PRICE_LT_LEG2_SELL_PRICE",
+          reason: leg1BuyPrice < leg2SellPrice ? "PRICE_VARIANCE_OK" : `PRICE_VARIANCE_REJECT:${leg1BuyPrice.toFixed(10)}>=${leg2SellPrice.toFixed(10)}`,
+        };
+      }
+    }
+  }
+  return {
+    ok: grossProfitRaw > 0n && amountOut > amountIn,
+    mode: "MULTI_LEG_NET",
+    grossReturnRatio,
+    rule: "FINAL_FLASHLOAN_ASSET_OUT_GT_IN_FOR_MULTI_LEG",
+    reason: grossProfitRaw > 0n && amountOut > amountIn ? "MULTI_LEG_NET_VARIANCE_OK" : "MULTI_LEG_NET_VARIANCE_REJECT",
+  };
+}
+
 function parseSourceList(envName: string, fallback: string) {
-  return (process.env[envName] || fallback)
+  return [process.env[envName] || fallback, process.env[`${envName}_EXTRA`] || ""]
+    .filter(Boolean)
+    .join(";")
     .split(";")
     .map((entry) => entry.trim())
     .filter(Boolean)
     .map((entry) => entry.split(":").map((part) => part.trim()));
+}
+
+function parseNumberListEnv(name: string, fallback: number[]) {
+  const raw = process.env[name];
+  const values = raw
+    ? raw.split(",").map((item) => Number(item.trim())).filter((value) => Number.isFinite(value) && value > 0)
+    : fallback;
+  return [...new Set(values)].sort((a, b) => a - b);
+}
+
+function addUsdCandidate(values: number[], candidate: number, maxUsd: number) {
+  if (!Number.isFinite(candidate) || candidate <= 0) return;
+  values.push(Math.min(candidate, maxUsd));
+}
+
+function buildSizeUsdCandidates(lowestPoolTvlUsd: number, maxFlashTvlFraction: number, requiredPremiumUsd: number) {
+  const maxScannableTradeUsd = lowestPoolTvlUsd * maxFlashTvlFraction;
+  const profitabilityTargetEdgeBps = numberEnv("LIVE_PROFITABILITY_TARGET_EDGE_BPS", 50);
+  const configuredMinTradeUsd = numberEnv("LIVE_MIN_FLASH_TRADE_USD", 0);
+  const economicMinTradeUsd = Math.max(
+    configuredMinTradeUsd,
+    profitabilityTargetEdgeBps > 0 ? requiredPremiumUsd * 10_000 / profitabilityTargetEdgeBps : 0,
+  );
+  const sizeFractions = parseNumberListEnv("FLASH_SIZE_SCAN_FRACTIONS", [0.001, 0.0025, 0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.15])
+    .filter((fraction) => fraction <= maxFlashTvlFraction);
+  if (!sizeFractions.includes(maxFlashTvlFraction)) sizeFractions.push(maxFlashTvlFraction);
+
+  const candidates: number[] = [];
+  for (const fraction of sizeFractions) {
+    addUsdCandidate(candidates, lowestPoolTvlUsd * fraction, maxScannableTradeUsd);
+  }
+  addUsdCandidate(candidates, economicMinTradeUsd, maxScannableTradeUsd);
+  addUsdCandidate(candidates, maxScannableTradeUsd, maxScannableTradeUsd);
+
+  return {
+    candidatesUsd: [...new Set(candidates.map((value) => Number(value.toFixed(8))))].sort((a, b) => a - b),
+    economicMinTradeUsd,
+    maxScannableTradeUsd,
+    profitabilityTargetEdgeBps,
+    economicSizeOk: economicMinTradeUsd <= maxScannableTradeUsd,
+  };
 }
 
 async function getJson(path: string) {
@@ -322,15 +623,150 @@ async function safeGetLogs(
 ) {
   const logs: ethers.Log[] = [];
   let rejected = 0;
+  const callTimeoutMs = intEnv("LIVE_RPC_CALL_TIMEOUT_MS", DEFAULT_RPC_CALL_TIMEOUT_MS);
   for (let start = fromBlock; start <= toBlock; start += chunkSize) {
     const end = Math.min(toBlock, start + chunkSize - 1);
     try {
-      logs.push(...await provider.getLogs({ ...filter, fromBlock: start, toBlock: end }));
+      logs.push(...await withTimeout(
+        provider.getLogs({ ...filter, fromBlock: start, toBlock: end }),
+        callTimeoutMs,
+        "DISCOVERY_GET_LOGS",
+      ));
     } catch {
       rejected += 1;
     }
   }
   return { logs, rejected };
+}
+
+type CachedDiscoveryLog = {
+  address: string;
+  topics: string[];
+  data: string;
+  blockNumber: number;
+  transactionHash?: string;
+  index?: number;
+  logIndex?: number;
+};
+
+type DiscoveryCacheEntry = {
+  fromBlock: number;
+  toBlock: number;
+  logs: CachedDiscoveryLog[];
+};
+
+type DiscoveryCache = Record<string, DiscoveryCacheEntry>;
+
+let inMemoryDiscoveryCache: DiscoveryCache | null = null;
+let discoveryCacheLoadedPath: string | null = null;
+let discoveryCacheFilesystemBlocked = false;
+
+function discoveryCacheEnabled() {
+  return process.env.LIVE_DISCOVERY_CACHE_ENABLED !== "false";
+}
+
+function discoveryCachePath() {
+  return process.env.LIVE_DISCOVERY_CACHE_PATH || path.join(process.cwd(), ".cache", "live-discovery-cache.json");
+}
+
+function discoveryCacheRefreshOverlapBlocks() {
+  return Math.max(1, intEnv("LIVE_DISCOVERY_CACHE_REFRESH_OVERLAP_BLOCKS", 64));
+}
+
+function readDiscoveryCache(): DiscoveryCache {
+  if (!discoveryCacheEnabled()) return {};
+  const cachePath = discoveryCachePath();
+  if (inMemoryDiscoveryCache !== null && discoveryCacheLoadedPath === cachePath) return inMemoryDiscoveryCache;
+  try {
+    if (discoveryCacheFilesystemBlocked || !fs.existsSync(cachePath)) return {};
+    const parsed = JSON.parse(fs.readFileSync(cachePath, "utf-8")) as DiscoveryCache;
+    inMemoryDiscoveryCache = parsed;
+    discoveryCacheLoadedPath = cachePath;
+    return parsed;
+  } catch (error: any) {
+    discoveryCacheFilesystemBlocked = true;
+    console.warn(`[discovery-cache] Read skipped: ${error?.message || error}`);
+    return {};
+  }
+}
+
+function writeDiscoveryCache(cache: DiscoveryCache) {
+  if (!discoveryCacheEnabled()) return;
+  const cachePath = discoveryCachePath();
+  inMemoryDiscoveryCache = cache;
+  discoveryCacheLoadedPath = cachePath;
+  if (discoveryCacheFilesystemBlocked) return;
+  try {
+    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    fs.writeFileSync(cachePath, `${JSON.stringify(cache)}\n`, "utf-8");
+  } catch (error: any) {
+    discoveryCacheFilesystemBlocked = true;
+    console.warn(`[discovery-cache] Persist skipped: ${error?.message || error}`);
+  }
+}
+
+function serializeLog(log: ethers.Log | any): CachedDiscoveryLog {
+  return {
+    address: String(log.address),
+    topics: Array.from(log.topics || []),
+    data: String(log.data || "0x"),
+    blockNumber: Number(log.blockNumber || 0),
+    transactionHash: log.transactionHash,
+    index: log.index,
+    logIndex: log.logIndex,
+  };
+}
+
+async function getCachedLogs(
+  provider: ethers.JsonRpcProvider,
+  cacheKey: string,
+  filter: Omit<ethers.Filter, "fromBlock" | "toBlock">,
+  fromBlock: number,
+  toBlock: number,
+  chunkSize: number,
+) {
+  if (!discoveryCacheEnabled()) {
+    return { ...(await safeGetLogs(provider, filter, fromBlock, toBlock, chunkSize)), cacheHit: false };
+  }
+  const cache = readDiscoveryCache();
+  const entry = cache[cacheKey];
+  const maxLogs = intEnv("LIVE_DISCOVERY_CACHE_MAX_LOGS", 50_000);
+  const cachedLogs = entry?.logs?.filter((log) => log.blockNumber >= fromBlock && log.blockNumber <= toBlock) || [];
+  const overlapBlocks = discoveryCacheRefreshOverlapBlocks();
+  if (entry && entry.fromBlock <= fromBlock && entry.toBlock >= toBlock && toBlock <= entry.toBlock - overlapBlocks) {
+    return { logs: cachedLogs, rejected: 0, cacheHit: true };
+  }
+
+  const fetchFrom = entry
+    ? Math.max(fromBlock, Math.max(entry.fromBlock, entry.toBlock - overlapBlocks + 1))
+    : fromBlock;
+  const fetched = fetchFrom <= toBlock
+    ? await safeGetLogs(provider, filter, fetchFrom, toBlock, chunkSize)
+    : { logs: [] as ethers.Log[], rejected: 0 };
+  const mergedByKey = new Map<string, CachedDiscoveryLog>();
+  for (const log of entry?.logs || []) {
+    const logKey = `${log.blockNumber}:${log.transactionHash || ""}:${log.logIndex ?? log.index ?? 0}:${log.address}:${log.topics.join(",")}`;
+    mergedByKey.set(logKey, log);
+  }
+  for (const log of fetched.logs.map(serializeLog)) {
+    const logKey = `${log.blockNumber}:${log.transactionHash || ""}:${log.logIndex ?? log.index ?? 0}:${log.address}:${log.topics.join(",")}`;
+    mergedByKey.set(logKey, log);
+  }
+  const merged = [...mergedByKey.values()]
+    .sort((left, right) => left.blockNumber - right.blockNumber || (left.logIndex ?? left.index ?? 0) - (right.logIndex ?? right.index ?? 0))
+    .slice(-maxLogs);
+  cache[cacheKey] = {
+    fromBlock: Math.min(entry?.fromBlock ?? fromBlock, fromBlock),
+    toBlock: Math.max(entry?.toBlock ?? toBlock, toBlock),
+    logs: merged,
+  };
+  writeDiscoveryCache(cache);
+
+  return {
+    logs: merged.filter((log) => log.blockNumber >= fromBlock && log.blockNumber <= toBlock),
+    rejected: fetched.rejected,
+    cacheHit: cachedLogs.length > 0,
+  };
 }
 
 async function loadTokenMeta(provider: ethers.JsonRpcProvider, cache: Map<string, TokenMeta>, address: string, flashloanEligible = false) {
@@ -420,7 +856,7 @@ async function discoverBalancerFlashloanLiquidity(provider: ethers.JsonRpcProvid
     }
   }
   if (topic) {
-    const scan = await safeGetLogs(provider, { address: vaultAddress, topics: [topic] }, fromBlock, latestBlock, chunk);
+    const scan = await getCachedLogs(provider, `flashloan-balancer:${vaultAddress}:${topic}`, { address: vaultAddress, topics: [topic] }, fromBlock, latestBlock, chunk);
     const vault = new ethers.Contract(vaultAddress, BALANCER_VAULT_ABI, provider);
     for (const log of scan.logs) {
       try {
@@ -612,10 +1048,12 @@ async function addV2Pair(
 async function discoverV2(provider: ethers.JsonRpcProvider, tokenCache: Map<string, TokenMeta>, edges: Map<string, Edge>, stats: DiscoveryStats, latestBlock: number, flashloanAssets: TokenMeta[]) {
   const sources = parseSourceList(
     "LIVE_DISCOVERY_V2_FACTORIES",
-    "QuickSwapV2:0x5757371414417b8c6caad45baef941abc7d3ab32:0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff:30;SushiSwapV2:0xc35DADB65012eC5796536bD9864eD8773aBc74C4:0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506:30",
+    "QuickSwapV2:0x5757371414417b8c6caad45baef941abc7d3ab32:0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff:30;SushiSwapV2:0xc35DADB65012eC5796536bD9864eD8773aBc74C4:0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506:30;DfynV2:0xE7fb3e833eFE5F9c441105EB65ef8b261266423B:0xA102072A4C07F06EC3B4900FDC4C7B80b6c57429:30;ApeSwapV2:0xCf083Be4164828f00cAE704EC15a36D711491284:0xC0788A3aD43d79aa53B09c2EaCc313A787d1d607:30;RetroClassicV2:0x1fC46294195aA87F77fAE299A14Bd1728dC1Cca9:0x77F0e98e3F2F3134496C2B769f40c891351524d1:30",
   );
   const lookback = intEnv("LIVE_DISCOVERY_LOOKBACK_BLOCKS", DEFAULT_DISCOVERY_LOOKBACK_BLOCKS);
   const chunk = Math.max(1, intEnv("LIVE_DISCOVERY_LOG_CHUNK_BLOCKS", DEFAULT_DISCOVERY_LOG_CHUNK_BLOCKS));
+  const callTimeoutMs = intEnv("LIVE_RPC_CALL_TIMEOUT_MS", DEFAULT_RPC_CALL_TIMEOUT_MS);
+  const pairQueryLimit = Math.max(1, intEnv("LIVE_DISCOVERY_V2_PAIR_QUERY_LIMIT", 80));
   const fromBlock = Math.max(0, latestBlock - lookback);
   const iface = new ethers.Interface(V2_FACTORY_ABI);
   const topic = iface.getEvent("PairCreated")?.topicHash;
@@ -625,8 +1063,9 @@ async function discoverV2(provider: ethers.JsonRpcProvider, tokenCache: Map<stri
     const dexId = venueName.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
     const factory = new ethers.Contract(factoryAddress, V2_FACTORY_ABI, provider);
     const seen = new Set<string>();
+    const normalizedFactory = normalize(factoryAddress);
     const scan = topic
-      ? await safeGetLogs(provider, { address: normalize(factoryAddress), topics: [topic] }, fromBlock, latestBlock, chunk)
+      ? await getCachedLogs(provider, `v2:${normalizedFactory}:${topic}`, { address: normalizedFactory, topics: [topic] }, fromBlock, latestBlock, chunk)
       : { logs: [], rejected: 0 };
     stats.rejectedLogScan += scan.rejected;
     for (const log of scan.logs) {
@@ -635,7 +1074,11 @@ async function discoverV2(provider: ethers.JsonRpcProvider, tokenCache: Map<stri
         const pair = normalize(parsed?.args?.pair);
         if (seen.has(pair.toLowerCase())) continue;
         seen.add(pair.toLowerCase());
-        await addV2Pair(provider, tokenCache, edges, stats, venueName, dexId, router, pair, Number(feeRaw || 30), latestBlock);
+        await withTimeout(
+          addV2Pair(provider, tokenCache, edges, stats, venueName, dexId, router, pair, Number(feeRaw || 30), latestBlock),
+          callTimeoutMs,
+          `V2_ADD_PAIR_${dexId}`,
+        );
       } catch {
         stats.rejectedMetadata += 1;
       }
@@ -647,12 +1090,20 @@ async function discoverV2(provider: ethers.JsonRpcProvider, tokenCache: Map<stri
         assetPairs.push([flashloanAssets[i], flashloanAssets[j]]);
       }
     }
-    await runWithConcurrency(assetPairs, intEnv("LIVE_DISCOVERY_CONCURRENCY", DEFAULT_DISCOVERY_CONCURRENCY), async ([left, right]) => {
+    await runWithConcurrency(assetPairs.slice(0, pairQueryLimit), intEnv("LIVE_DISCOVERY_CONCURRENCY", DEFAULT_DISCOVERY_CONCURRENCY), async ([left, right]) => {
         try {
-          const pair = normalize(await factory.getPair(left.address, right.address));
+          const pair = normalize(await withTimeout(
+            factory.getPair(left.address, right.address) as Promise<string>,
+            callTimeoutMs,
+            `V2_GET_PAIR_${dexId}`,
+          ));
           if (pair === ZERO_ADDRESS || seen.has(pair.toLowerCase())) return;
           seen.add(pair.toLowerCase());
-          await addV2Pair(provider, tokenCache, edges, stats, venueName, dexId, router, pair, Number(feeRaw || 30), latestBlock);
+          await withTimeout(
+            addV2Pair(provider, tokenCache, edges, stats, venueName, dexId, router, pair, Number(feeRaw || 30), latestBlock),
+            callTimeoutMs,
+            `V2_ADD_PAIR_${dexId}`,
+          );
         } catch {
           stats.rejectedMetadata += 1;
         }
@@ -668,6 +1119,7 @@ async function addV3Pool(
   venueName: string,
   dexId: string,
   router: string,
+  quoter: string,
   poolAddress: string,
   fee: number,
   stateBlock: number,
@@ -684,10 +1136,18 @@ async function addV3Pool(
     stats.rejectedMetadata += 1;
     return;
   }
+  const [balance0, balance1] = await Promise.all([
+    tokenBalance(provider, token0.address, poolAddress).catch(() => 0n),
+    tokenBalance(provider, token1.address, poolAddress).catch(() => 0n),
+  ]);
   const syntheticReserve = BigInt(liquidity);
-  const tvlUsd = 0;
+  const reserve0 = balance0 > 0n ? balance0 : syntheticReserve;
+  const reserve1 = balance1 > 0n ? balance1 : syntheticReserve;
+  const tvlUsd = estimateTvlUsd(token0, reserve0, token1, reserve1);
   const feeBps = Math.max(1, Math.floor(fee / 100));
   for (const [tokenIn, tokenOut] of [[token0, token1], [token1, token0]] as const) {
+    const reserveIn = sameAddress(tokenIn.address, token0.address) ? reserve0 : reserve1;
+    const reserveOut = sameAddress(tokenOut.address, token0.address) ? reserve0 : reserve1;
     addEdge(edges, stats, edgeBase({
       dexId,
       venueName,
@@ -697,14 +1157,14 @@ async function addV3Pool(
       tokenOut,
       invariant: "V3_CONCENTRATED_LIQUIDITY",
       feeBps,
-      reserveIn: syntheticReserve,
-      reserveOut: syntheticReserve,
+      reserveIn,
+      reserveOut,
       tvlUsd,
       stateBlock,
       quoteAdapter: "quoteV3ExactInputSingle",
       calldataAdapter: "buildV3ExactInputSingleCalldata",
       executorTarget: router,
-      extra: { v3Fee: fee },
+      extra: { v3Fee: fee, v3Quoter: quoter },
     }));
   }
 }
@@ -712,7 +1172,7 @@ async function addV3Pool(
 async function discoverV3(provider: ethers.JsonRpcProvider, tokenCache: Map<string, TokenMeta>, edges: Map<string, Edge>, stats: DiscoveryStats, latestBlock: number, flashloanAssets: TokenMeta[]) {
   const sources = parseSourceList(
     "LIVE_DISCOVERY_V3_FACTORIES",
-    `UniswapV3:0x1F98431c8aD98523631AE4a59f267346ea31F984:${ROUTE_ADAPTER_TARGETS.uniswapV3Router}:${ROUTE_ADAPTER_TARGETS.uniswapV3Quoter}:100,500,3000,10000`,
+    `UniswapV3:0x1F98431c8aD98523631AE4a59f267346ea31F984:${ROUTE_ADAPTER_TARGETS.uniswapV3Router}:${ROUTE_ADAPTER_TARGETS.uniswapV3Quoter}:100,500,3000,10000;RetroV3:0x91e1B99072f238352f59e58de875691e20Dc19c1:0x1891783cb3497Fdad1F25C933225243c2c7c4102:0xddc9Ef56c6bf83F7116Fad5Fbc41272B07ac70C1:100,500,3000,10000`,
   );
   const lookback = intEnv("LIVE_DISCOVERY_LOOKBACK_BLOCKS", DEFAULT_DISCOVERY_LOOKBACK_BLOCKS);
   const chunk = Math.max(1, intEnv("LIVE_DISCOVERY_LOG_CHUNK_BLOCKS", DEFAULT_DISCOVERY_LOG_CHUNK_BLOCKS));
@@ -720,17 +1180,19 @@ async function discoverV3(provider: ethers.JsonRpcProvider, tokenCache: Map<stri
   const iface = new ethers.Interface(V3_FACTORY_ABI);
   const topic = iface.getEvent("PoolCreated")?.topicHash;
 
-  for (const [venueName, factoryAddress, router, , feeListRaw] of sources) {
+  for (const [venueName, factoryAddress, router, quoter, feeListRaw] of sources) {
     if (!factoryAddress || !router) continue;
     const dexId = venueName.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
     const factory = new ethers.Contract(factoryAddress, V3_FACTORY_ABI, provider);
     const seen = new Set<string>();
     const maxPools = intEnv("LIVE_V3_MAX_POOLS", DEFAULT_V3_MAX_POOLS);
     const callTimeoutMs = intEnv("LIVE_RPC_CALL_TIMEOUT_MS", DEFAULT_RPC_CALL_TIMEOUT_MS);
+    const normalizedFactory = normalize(factoryAddress);
     const scan = topic
-      ? await safeGetLogs(provider, { address: normalize(factoryAddress), topics: [topic] }, fromBlock, latestBlock, chunk)
+      ? await getCachedLogs(provider, `v3:${normalizedFactory}:${topic}`, { address: normalizedFactory, topics: [topic] }, fromBlock, latestBlock, chunk)
       : { logs: [], rejected: 0 };
     stats.rejectedLogScan += scan.rejected;
+    const logPools: Array<{ pool: string; fee: number }> = [];
     for (const log of scan.logs) {
       if (seen.size >= maxPools) break;
       try {
@@ -738,17 +1200,25 @@ async function discoverV3(provider: ethers.JsonRpcProvider, tokenCache: Map<stri
         const pool = normalize(parsed?.args?.pool);
         if (seen.has(pool.toLowerCase())) continue;
         seen.add(pool.toLowerCase());
+        logPools.push({ pool, fee: Number(parsed?.args?.fee) });
+      } catch {
+        stats.rejectedMetadata += 1;
+      }
+    }
+    await runWithConcurrency(logPools, intEnv("LIVE_DISCOVERY_CONCURRENCY", DEFAULT_DISCOVERY_CONCURRENCY), async ({ pool, fee }) => {
+      try {
         await withTimeout(
-          addV3Pool(provider, tokenCache, edges, stats, venueName, dexId, router, pool, Number(parsed?.args?.fee), latestBlock),
+          addV3Pool(provider, tokenCache, edges, stats, venueName, dexId, router, quoter || ROUTE_ADAPTER_TARGETS.uniswapV3Quoter, pool, fee, latestBlock),
           callTimeoutMs * 2,
           "V3_ADD_POOL",
         );
       } catch {
         stats.rejectedMetadata += 1;
       }
-    }
+    });
 
     const fees = (feeListRaw || "100,500,3000,10000").split(",").map((fee) => Number(fee.trim())).filter(Number.isFinite);
+    const poolQueryLimit = Math.max(1, intEnv("LIVE_DISCOVERY_V3_POOL_QUERY_LIMIT", 120));
     const poolQueries: Array<[TokenMeta, TokenMeta, number]> = [];
     for (let i = 0; i < flashloanAssets.length; i += 1) {
       for (let j = i + 1; j < flashloanAssets.length; j += 1) {
@@ -757,7 +1227,7 @@ async function discoverV3(provider: ethers.JsonRpcProvider, tokenCache: Map<stri
         }
       }
     }
-    await runWithConcurrency(poolQueries, intEnv("LIVE_DISCOVERY_CONCURRENCY", DEFAULT_DISCOVERY_CONCURRENCY), async ([left, right, fee]) => {
+    await runWithConcurrency(poolQueries.slice(0, poolQueryLimit), intEnv("LIVE_DISCOVERY_CONCURRENCY", DEFAULT_DISCOVERY_CONCURRENCY), async ([left, right, fee]) => {
           if (seen.size >= maxPools) return;
           try {
             const pool = normalize(await withTimeout(
@@ -769,7 +1239,7 @@ async function discoverV3(provider: ethers.JsonRpcProvider, tokenCache: Map<stri
             if (seen.size >= maxPools) return;
             seen.add(pool.toLowerCase());
             await withTimeout(
-              addV3Pool(provider, tokenCache, edges, stats, venueName, dexId, router, pool, fee, latestBlock),
+              addV3Pool(provider, tokenCache, edges, stats, venueName, dexId, router, quoter || ROUTE_ADAPTER_TARGETS.uniswapV3Quoter, pool, fee, latestBlock),
               callTimeoutMs * 2,
               "V3_ADD_POOL",
             );
@@ -788,6 +1258,7 @@ async function addAlgebraPool(
   venueName: string,
   dexId: string,
   router: string,
+  quoter: string,
   poolAddress: string,
   stateBlock: number,
 ) {
@@ -803,9 +1274,18 @@ async function addAlgebraPool(
     stats.rejectedMetadata += 1;
     return;
   }
+  const [balance0, balance1] = await Promise.all([
+    tokenBalance(provider, token0.address, poolAddress).catch(() => 0n),
+    tokenBalance(provider, token1.address, poolAddress).catch(() => 0n),
+  ]);
   const syntheticReserve = BigInt(liquidity);
+  const reserve0 = balance0 > 0n ? balance0 : syntheticReserve;
+  const reserve1 = balance1 > 0n ? balance1 : syntheticReserve;
+  const tvlUsd = estimateTvlUsd(token0, reserve0, token1, reserve1);
   const feeBps = Math.max(1, Math.floor(Number(globalState.fee) / 100));
   for (const [tokenIn, tokenOut] of [[token0, token1], [token1, token0]] as const) {
+    const reserveIn = sameAddress(tokenIn.address, token0.address) ? reserve0 : reserve1;
+    const reserveOut = sameAddress(tokenOut.address, token0.address) ? reserve0 : reserve1;
     addEdge(edges, stats, edgeBase({
       dexId,
       venueName,
@@ -815,13 +1295,14 @@ async function addAlgebraPool(
       tokenOut,
       invariant: "ALGEBRA_CONCENTRATED_LIQUIDITY",
       feeBps,
-      reserveIn: syntheticReserve,
-      reserveOut: syntheticReserve,
-      tvlUsd: 0,
+      reserveIn,
+      reserveOut,
+      tvlUsd,
       stateBlock,
       quoteAdapter: "quoteAlgebraExactInputSingle",
       calldataAdapter: "buildAlgebraExactInputSingleCalldata",
       executorTarget: router,
+      extra: { algebraQuoter: quoter },
     }));
   }
 }
@@ -837,17 +1318,19 @@ async function discoverAlgebra(provider: ethers.JsonRpcProvider, tokenCache: Map
   const iface = new ethers.Interface(ALGEBRA_FACTORY_ABI);
   const topic = iface.getEvent("Pool")?.topicHash;
 
-  for (const [venueName, factoryAddress, router] of sources) {
+  for (const [venueName, factoryAddress, router, quoter] of sources) {
     if (!factoryAddress || !router) continue;
     const dexId = venueName.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
     const factory = new ethers.Contract(factoryAddress, ALGEBRA_FACTORY_ABI, provider);
     const seen = new Set<string>();
     const maxPools = intEnv("LIVE_ALGEBRA_MAX_POOLS", DEFAULT_ALGEBRA_MAX_POOLS);
     const callTimeoutMs = intEnv("LIVE_RPC_CALL_TIMEOUT_MS", DEFAULT_RPC_CALL_TIMEOUT_MS);
+    const normalizedFactory = normalize(factoryAddress);
     const scan = topic
-      ? await safeGetLogs(provider, { address: normalize(factoryAddress), topics: [topic] }, fromBlock, latestBlock, chunk)
+      ? await getCachedLogs(provider, `algebra:${normalizedFactory}:${topic}`, { address: normalizedFactory, topics: [topic] }, fromBlock, latestBlock, chunk)
       : { logs: [], rejected: 0 };
     stats.rejectedLogScan += scan.rejected;
+    const logPools: string[] = [];
     for (const log of scan.logs) {
       if (seen.size >= maxPools) break;
       try {
@@ -855,22 +1338,30 @@ async function discoverAlgebra(provider: ethers.JsonRpcProvider, tokenCache: Map
         const pool = normalize(parsed?.args?.pool);
         if (seen.has(pool.toLowerCase())) continue;
         seen.add(pool.toLowerCase());
+        logPools.push(pool);
+      } catch {
+        stats.rejectedMetadata += 1;
+      }
+    }
+    await runWithConcurrency(logPools, intEnv("LIVE_DISCOVERY_CONCURRENCY", DEFAULT_DISCOVERY_CONCURRENCY), async (pool) => {
+      try {
         await withTimeout(
-          addAlgebraPool(provider, tokenCache, edges, stats, venueName, dexId, router, pool, latestBlock),
+          addAlgebraPool(provider, tokenCache, edges, stats, venueName, dexId, router, quoter || ROUTE_ADAPTER_TARGETS.algebraQuoter, pool, latestBlock),
           callTimeoutMs * 2,
           "ALGEBRA_ADD_POOL",
         );
       } catch {
         stats.rejectedMetadata += 1;
       }
-    }
+    });
+    const pairQueryLimit = Math.max(1, intEnv("LIVE_DISCOVERY_ALGEBRA_PAIR_QUERY_LIMIT", 120));
     const assetPairs: Array<[TokenMeta, TokenMeta]> = [];
     for (let i = 0; i < flashloanAssets.length; i += 1) {
       for (let j = i + 1; j < flashloanAssets.length; j += 1) {
         assetPairs.push([flashloanAssets[i], flashloanAssets[j]]);
       }
     }
-    await runWithConcurrency(assetPairs, intEnv("LIVE_DISCOVERY_CONCURRENCY", DEFAULT_DISCOVERY_CONCURRENCY), async ([left, right]) => {
+    await runWithConcurrency(assetPairs.slice(0, pairQueryLimit), intEnv("LIVE_DISCOVERY_CONCURRENCY", DEFAULT_DISCOVERY_CONCURRENCY), async ([left, right]) => {
         if (seen.size >= maxPools) return;
         try {
           const pool = normalize(await withTimeout(
@@ -882,7 +1373,7 @@ async function discoverAlgebra(provider: ethers.JsonRpcProvider, tokenCache: Map
           if (seen.size >= maxPools) return;
           seen.add(pool.toLowerCase());
           await withTimeout(
-            addAlgebraPool(provider, tokenCache, edges, stats, venueName, dexId, router, pool, latestBlock),
+            addAlgebraPool(provider, tokenCache, edges, stats, venueName, dexId, router, quoter || ROUTE_ADAPTER_TARGETS.algebraQuoter, pool, latestBlock),
             callTimeoutMs * 2,
             "ALGEBRA_ADD_POOL",
           );
@@ -960,7 +1451,8 @@ async function discoverBalancer(provider: ethers.JsonRpcProvider, tokenCache: Ma
   const iface = new ethers.Interface(BALANCER_VAULT_ABI);
   const topic = iface.getEvent("PoolRegistered")?.topicHash;
   if (!topic) return;
-  const scan = await safeGetLogs(provider, { address: normalize(vaultAddress), topics: [topic] }, fromBlock, latestBlock, chunk);
+  const normalizedVault = normalize(vaultAddress);
+  const scan = await getCachedLogs(provider, `balancer:${normalizedVault}:${topic}`, { address: normalizedVault, topics: [topic] }, fromBlock, latestBlock, chunk);
   stats.rejectedLogScan += scan.rejected;
   const vault = new ethers.Contract(vaultAddress, BALANCER_VAULT_ABI, provider);
   let count = 0;
@@ -1029,17 +1521,43 @@ async function derivePrices(provider: ethers.JsonRpcProvider, tokenCache: Map<st
   }
 
   let changed = true;
-  for (let pass = 0; pass < 4 && changed; pass += 1) {
+  const minPriceAnchorUsd = numberEnv("PRICE_DERIVATION_MIN_ANCHOR_USD", 100);
+  for (let pass = 0; pass < 6 && changed; pass += 1) {
     changed = false;
+    const candidates = new Map<string, Array<{ value: number; weight: number }>>();
     for (const edge of edges) {
       const tokenIn = tokenCache.get(edge.tokenIn.toLowerCase());
       const tokenOut = tokenCache.get(edge.tokenOut.toLowerCase());
       if (!tokenIn || !tokenOut) continue;
-      if (tokenIn.priceUsd && !tokenOut.priceUsd && edge.reserveIn > 0n && edge.reserveOut > 0n) {
-        tokenOut.priceUsd = rawToFloat(edge.reserveIn, tokenIn.decimals) * tokenIn.priceUsd / rawToFloat(edge.reserveOut, tokenOut.decimals);
-        changed = true;
-      } else if (!tokenIn.priceUsd && tokenOut.priceUsd && edge.reserveIn > 0n && edge.reserveOut > 0n) {
-        tokenIn.priceUsd = rawToFloat(edge.reserveOut, tokenOut.decimals) * tokenOut.priceUsd / rawToFloat(edge.reserveIn, tokenIn.decimals);
+      if (edge.reserveIn <= 0n || edge.reserveOut <= 0n) continue;
+      const inUnits = rawToFloat(edge.reserveIn, tokenIn.decimals);
+      const outUnits = rawToFloat(edge.reserveOut, tokenOut.decimals);
+      if (inUnits <= 0 || outUnits <= 0) continue;
+      if (tokenIn.priceUsd && !tokenOut.priceUsd) {
+        const weight = inUnits * tokenIn.priceUsd;
+        const value = weight / outUnits;
+        if (weight >= minPriceAnchorUsd && priceWithinBounds(tokenOut.symbol, value)) {
+          const list = candidates.get(tokenOut.address.toLowerCase()) || [];
+          list.push({ value, weight });
+          candidates.set(tokenOut.address.toLowerCase(), list);
+        }
+      }
+      if (tokenOut.priceUsd && !tokenIn.priceUsd) {
+        const weight = outUnits * tokenOut.priceUsd;
+        const value = weight / inUnits;
+        if (weight >= minPriceAnchorUsd && priceWithinBounds(tokenIn.symbol, value)) {
+          const list = candidates.get(tokenIn.address.toLowerCase()) || [];
+          list.push({ value, weight });
+          candidates.set(tokenIn.address.toLowerCase(), list);
+        }
+      }
+    }
+    for (const [address, values] of candidates) {
+      const token = tokenCache.get(address);
+      if (!token || token.priceUsd) continue;
+      const derived = weightedMedian(values);
+      if (derived !== undefined) {
+        token.priceUsd = derived;
         changed = true;
       }
     }
@@ -1056,8 +1574,279 @@ async function derivePrices(provider: ethers.JsonRpcProvider, tokenCache: Map<st
   }
 }
 
+async function fastPreSendRevalidate(provider: ethers.JsonRpcProvider, edge: Edge, currentBlock: number, maxStateAgeBlocks: number): Promise<PreSendResult> {
+  if (currentBlock - edge.stateBlock > maxStateAgeBlocks) {
+    return { ok: false, error: "POOL_STATE_STALE", currentBlock };
+  }
+  if (edge.reserveIn <= 0n || edge.reserveOut <= 0n) {
+    return { ok: false, error: "POOL_ZERO_LIQUIDITY", currentBlock };
+  }
+  if (!edge.calldataAdapter || !edge.quoteAdapter) {
+    return { ok: false, error: "POOL_ADAPTER_MISSING", currentBlock };
+  }
+  try {
+    if (edge.invariant === "V2_CPMM") {
+      const pair = new ethers.Contract(edge.poolAddress, V2_PAIR_ABI, provider);
+      const reserves = await pair.getReserves();
+      if (BigInt(reserves.reserve0) <= 0n || BigInt(reserves.reserve1) <= 0n) {
+        return { ok: false, error: "V2_ZERO_LIVE_RESERVES", currentBlock };
+      }
+      return { ok: true, currentBlock };
+    }
+
+    if (edge.invariant === "V3_CONCENTRATED_LIQUIDITY") {
+      const pool = new ethers.Contract(edge.poolAddress, V3_POOL_ABI, provider);
+      const strictFee = boolEnv("LIVE_PRESEND_STRICT_V3_FEE", false);
+      const reads = strictFee
+        ? await Promise.all([pool.fee(), pool.liquidity(), pool.slot0()])
+        : await Promise.all([Promise.resolve(edge.extra?.v3Fee ?? edge.feeBps * 100), pool.liquidity(), pool.slot0()]);
+      const [fee, liquidity, slot0] = reads;
+      if (strictFee) {
+        const expectedFee = edge.extra?.v3Fee ?? (edge.feeBps > 100 ? edge.feeBps : edge.feeBps * 100);
+        if (Number(fee) !== expectedFee && expectedFee > 0) {
+          return { ok: false, error: "V3_FEE_MISMATCH", currentBlock };
+        }
+      }
+      if (BigInt(liquidity) <= 0n) return { ok: false, error: "V3_ZERO_LIQUIDITY", currentBlock };
+      if (BigInt(slot0.sqrtPriceX96) <= 0n || slot0.unlocked === false) return { ok: false, error: "V3_INVALID_SLOT0", currentBlock };
+      return { ok: true, currentBlock };
+    }
+
+    if (edge.invariant === "ALGEBRA_CONCENTRATED_LIQUIDITY") {
+      const pool = new ethers.Contract(edge.poolAddress, ALGEBRA_POOL_ABI, provider);
+      const [liquidity, globalState] = await Promise.all([pool.liquidity(), pool.globalState()]);
+      if (BigInt(liquidity) <= 0n) return { ok: false, error: "ALGEBRA_ZERO_LIQUIDITY", currentBlock };
+      if (BigInt(globalState.price) <= 0n || globalState.unlocked === false) return { ok: false, error: "ALGEBRA_INVALID_GLOBAL_STATE", currentBlock };
+      return { ok: true, currentBlock };
+    }
+
+    return await preSendRevalidate(provider, edge, maxStateAgeBlocks);
+  } catch (error: any) {
+    return { ok: false, error: error?.reason || error?.shortMessage || error?.message || "FAST_PRE_SEND_REVALIDATION_FAILED", currentBlock };
+  }
+}
+
+function staticPreSendGate(edge: Edge, currentBlock: number, maxStateAgeBlocks: number): PreSendResult | undefined {
+  if (currentBlock - edge.stateBlock > maxStateAgeBlocks) {
+    return { ok: false, error: "POOL_STATE_STALE", currentBlock };
+  }
+  if (edge.reserveIn <= 0n || edge.reserveOut <= 0n) {
+    return { ok: false, error: "POOL_ZERO_LIQUIDITY", currentBlock };
+  }
+  if (!edge.calldataAdapter || !edge.quoteAdapter) {
+    return { ok: false, error: "POOL_ADAPTER_MISSING", currentBlock };
+  }
+  return undefined;
+}
+
+async function buildBatchedPreSendCache(
+  provider: ethers.JsonRpcProvider,
+  edges: Edge[],
+  currentBlock: number,
+  maxStateAgeBlocks: number,
+): Promise<Map<string, PreSendResult>> {
+  const cache = new Map<string, PreSendResult>();
+  if (!boolEnv("LIVE_PRESEND_MULTICALL", true)) return cache;
+
+  const v2Iface = new ethers.Interface(V2_PAIR_ABI);
+  const v3Iface = new ethers.Interface(V3_POOL_ABI);
+  const algebraIface = new ethers.Interface(ALGEBRA_POOL_ABI);
+  type Descriptor = { key: string; edge: Edge; calls: Array<"fee" | "globalState" | "liquidity" | "reserves" | "slot0"> };
+  const descriptors: Descriptor[] = [];
+  const seenPools = new Set<string>();
+  const calls: Array<{ target: string; allowFailure: boolean; callData: string }> = [];
+  const callCursor: Array<{ descriptorIndex: number; kind: Descriptor["calls"][number] }> = [];
+  const strictV3Fee = boolEnv("LIVE_PRESEND_STRICT_V3_FEE", false);
+
+  for (const edge of edges) {
+    const key = preSendPoolKey(edge);
+    if (seenPools.has(key)) continue;
+    seenPools.add(key);
+    const staticResult = staticPreSendGate(edge, currentBlock, maxStateAgeBlocks);
+    if (staticResult) {
+      cache.set(key, staticResult);
+      continue;
+    }
+
+    const descriptor: Descriptor = { key, edge, calls: [] };
+    if (edge.invariant === "V2_CPMM") {
+      descriptor.calls.push("reserves");
+      calls.push({ target: edge.poolAddress, allowFailure: true, callData: v2Iface.encodeFunctionData("getReserves") });
+      callCursor.push({ descriptorIndex: descriptors.length, kind: "reserves" });
+    } else if (edge.invariant === "V3_CONCENTRATED_LIQUIDITY") {
+      if (strictV3Fee) {
+        descriptor.calls.push("fee");
+        calls.push({ target: edge.poolAddress, allowFailure: true, callData: v3Iface.encodeFunctionData("fee") });
+        callCursor.push({ descriptorIndex: descriptors.length, kind: "fee" });
+      }
+      descriptor.calls.push("liquidity", "slot0");
+      calls.push({ target: edge.poolAddress, allowFailure: true, callData: v3Iface.encodeFunctionData("liquidity") });
+      callCursor.push({ descriptorIndex: descriptors.length, kind: "liquidity" });
+      calls.push({ target: edge.poolAddress, allowFailure: true, callData: v3Iface.encodeFunctionData("slot0") });
+      callCursor.push({ descriptorIndex: descriptors.length, kind: "slot0" });
+    } else if (edge.invariant === "ALGEBRA_CONCENTRATED_LIQUIDITY") {
+      descriptor.calls.push("liquidity", "globalState");
+      calls.push({ target: edge.poolAddress, allowFailure: true, callData: algebraIface.encodeFunctionData("liquidity") });
+      callCursor.push({ descriptorIndex: descriptors.length, kind: "liquidity" });
+      calls.push({ target: edge.poolAddress, allowFailure: true, callData: algebraIface.encodeFunctionData("globalState") });
+      callCursor.push({ descriptorIndex: descriptors.length, kind: "globalState" });
+    }
+
+    if (descriptor.calls.length > 0) descriptors.push(descriptor);
+  }
+
+  if (calls.length === 0) return cache;
+
+  const multicallAddress = normalize(process.env.MULTICALL3_ADDRESS || DEFAULT_MULTICALL3_ADDRESS);
+  const multicall = new ethers.Contract(multicallAddress, MULTICALL3_ABI, provider);
+  const chunkSize = Math.max(1, intEnv("LIVE_PRESEND_MULTICALL_CHUNK_SIZE", 160));
+  const callTimeoutMs = intEnv("LIVE_PRESEND_MULTICALL_TIMEOUT_MS", intEnv("LIVE_RPC_CALL_TIMEOUT_MS", DEFAULT_RPC_CALL_TIMEOUT_MS));
+  const rawResults: Array<{ success: boolean; returnData: string } | undefined> = new Array(calls.length);
+
+  for (let start = 0; start < calls.length; start += chunkSize) {
+    const chunk = calls.slice(start, start + chunkSize);
+    try {
+      const result = await withTimeout(
+        multicall.aggregate3(chunk),
+        callTimeoutMs,
+        "PRESEND_MULTICALL",
+      ) as Array<{ success: boolean; returnData: string }>;
+      result.forEach((item, offset) => {
+        rawResults[start + offset] = item;
+      });
+    } catch {
+      // Leave this chunk uncovered so per-pool validation can retry through the existing path.
+    }
+  }
+
+  const decoded = new Map<string, any>();
+  for (let index = 0; index < callCursor.length; index += 1) {
+    const result = rawResults[index];
+    if (!result?.success || !result.returnData || result.returnData === "0x") continue;
+    const cursor = callCursor[index];
+    const descriptor = descriptors[cursor.descriptorIndex];
+    const slot = `${descriptor.key}:${cursor.kind}`;
+    try {
+      if (descriptor.edge.invariant === "V2_CPMM" && cursor.kind === "reserves") {
+        decoded.set(slot, v2Iface.decodeFunctionResult("getReserves", result.returnData));
+      } else if (descriptor.edge.invariant === "V3_CONCENTRATED_LIQUIDITY") {
+        decoded.set(slot, v3Iface.decodeFunctionResult(cursor.kind, result.returnData));
+      } else if (descriptor.edge.invariant === "ALGEBRA_CONCENTRATED_LIQUIDITY") {
+        decoded.set(slot, algebraIface.decodeFunctionResult(cursor.kind, result.returnData));
+      }
+    } catch {
+      // Decode failure leaves the pool for fallback validation.
+    }
+  }
+
+  for (const descriptor of descriptors) {
+    if (cache.has(descriptor.key)) continue;
+    const { edge, key } = descriptor;
+    if (edge.invariant === "V2_CPMM") {
+      const reserves = decoded.get(`${key}:reserves`);
+      if (!reserves) continue;
+      cache.set(key, BigInt(reserves[0]) > 0n && BigInt(reserves[1]) > 0n
+        ? { ok: true, currentBlock }
+        : { ok: false, error: "V2_ZERO_LIVE_RESERVES", currentBlock });
+      continue;
+    }
+
+    if (edge.invariant === "V3_CONCENTRATED_LIQUIDITY") {
+      const liquidity = decoded.get(`${key}:liquidity`);
+      const slot0 = decoded.get(`${key}:slot0`);
+      if (!liquidity || !slot0) continue;
+      if (strictV3Fee) {
+        const fee = decoded.get(`${key}:fee`);
+        const expectedFee = edge.extra?.v3Fee ?? (edge.feeBps > 100 ? edge.feeBps : edge.feeBps * 100);
+        if (!fee || (Number(fee[0]) !== expectedFee && expectedFee > 0)) {
+          cache.set(key, { ok: false, error: "V3_FEE_MISMATCH", currentBlock });
+          continue;
+        }
+      }
+      cache.set(key, BigInt(liquidity[0]) > 0n && BigInt(slot0[0]) > 0n && slot0[6] !== false
+        ? { ok: true, currentBlock }
+        : { ok: false, error: BigInt(liquidity[0]) <= 0n ? "V3_ZERO_LIQUIDITY" : "V3_INVALID_SLOT0", currentBlock });
+      continue;
+    }
+
+    if (edge.invariant === "ALGEBRA_CONCENTRATED_LIQUIDITY") {
+      const liquidity = decoded.get(`${key}:liquidity`);
+      const globalState = decoded.get(`${key}:globalState`);
+      if (!liquidity || !globalState) continue;
+      cache.set(key, BigInt(liquidity[0]) > 0n && BigInt(globalState[0]) > 0n && globalState[6] !== false
+        ? { ok: true, currentBlock }
+        : { ok: false, error: BigInt(liquidity[0]) <= 0n ? "ALGEBRA_ZERO_LIQUIDITY" : "ALGEBRA_INVALID_GLOBAL_STATE", currentBlock });
+    }
+  }
+
+  return cache;
+}
+
+async function preSendCheckpoint(
+  provider: ethers.JsonRpcProvider,
+  tokenCache: Map<string, TokenMeta>,
+  allEdges: Edge[],
+  stats: DiscoveryStats,
+  seenPreSend: Set<string>,
+  liveEdges: Map<string, Edge>,
+  phase: string,
+) {
+  console.log(`LIVE_CYCLE_PHASE|phase=${phase}_PRICE_DERIVATION_START|edges=${allEdges.length}`);
+  await derivePrices(provider, tokenCache, allEdges);
+  const maxStateAgeBlocks = intEnv("LIVE_ROUTE_MAX_STATE_AGE_BLOCKS", DEFAULT_ROUTE_MAX_STATE_AGE_BLOCKS);
+  const preSendTimeoutMs = intEnv("LIVE_PRESEND_REVALIDATION_TIMEOUT_MS", intEnv("LIVE_RPC_CALL_TIMEOUT_MS", DEFAULT_RPC_CALL_TIMEOUT_MS));
+  const minRoutePoolTvlUsd = numberEnv("ROUTE_MIN_POOL_TVL_USD", numberEnv("MIN_POOL_TVL_USD", 5000));
+  const eligibleEdges = allEdges.filter((edge) => Number.isFinite(edge.tvlUsd) && edge.tvlUsd >= minRoutePoolTvlUsd);
+  const newEdges = eligibleEdges.filter((edge) => !seenPreSend.has(edgeRuntimeKey(edge)));
+  stats.rejectedLowTvlEdge = allEdges.length - eligibleEdges.length;
+  console.log(`LIVE_CYCLE_PHASE|phase=${phase}_PRESEND_REVALIDATION_START|edges=${newEdges.length}|eligibleEdges=${eligibleEdges.length}|lowTvlRejected=${stats.rejectedLowTvlEdge}|minRoutePoolTvlUsd=${minRoutePoolTvlUsd}`);
+  const currentBlock = await provider.getBlockNumber();
+  const poolValidationCache = new Map<string, Promise<PreSendResult>>();
+  const fastPath = boolEnv("LIVE_PRESEND_FAST_PATH", true);
+  if (fastPath) {
+    const batchCache = await buildBatchedPreSendCache(provider, newEdges, currentBlock, maxStateAgeBlocks);
+    for (const [key, result] of batchCache) poolValidationCache.set(key, Promise.resolve(result));
+    if (batchCache.size > 0) {
+      console.log(`LIVE_CYCLE_PHASE|phase=${phase}_PRESEND_BATCH_CACHE|pools=${batchCache.size}|edges=${newEdges.length}`);
+    }
+  }
+  const validateEdge = (edge: Edge) => {
+    if (!fastPath) return preSendRevalidate(provider, edge, maxStateAgeBlocks);
+    const poolKey = preSendPoolKey(edge);
+    const cached = poolValidationCache.get(poolKey);
+    if (cached) return cached;
+    const validation = fastPreSendRevalidate(provider, edge, currentBlock, maxStateAgeBlocks);
+    poolValidationCache.set(poolKey, validation);
+    return validation;
+  };
+  await runWithConcurrency(newEdges, intEnv("LIVE_PRESEND_REVALIDATION_CONCURRENCY", intEnv("LIVE_DISCOVERY_CONCURRENCY", DEFAULT_DISCOVERY_CONCURRENCY)), async (edge) => {
+    const key = edgeRuntimeKey(edge);
+    seenPreSend.add(key);
+    const result = await withTimeout(
+      validateEdge(edge),
+      preSendTimeoutMs,
+      `PRESEND_REVALIDATE_${edge.invariant}`,
+    ).catch((error) => ({ ok: false, error: error?.message }));
+    if (!result.ok) {
+      stats.rejectedPreSend += 1;
+      const reason = String(result.error || "PRE_SEND_REVALIDATION_FAILED");
+      stats.preSendRejectReasons[reason] = (stats.preSendRejectReasons[reason] || 0) + 1;
+      return;
+    }
+    liveEdges.set(key, edge);
+  });
+  console.log(`LIVE_CYCLE_PHASE|phase=${phase}_PRESEND_REVALIDATION_END|liveEdges=${liveEdges.size}|checked=${seenPreSend.size}|preSendRejects=${stats.rejectedPreSend}`);
+}
+
 async function discoverGraph(provider: ethers.JsonRpcProvider) {
   console.log("LIVE_CYCLE_PHASE|phase=DISCOVERY_GRAPH_START");
+  const startedAt = Date.now();
+  const maxRuntimeMs = intEnv("LIVE_DISCOVERY_MAX_RUNTIME_MS", 600_000);
+  const preSendReserveMs = Math.min(
+    Math.max(30_000, Math.floor(maxRuntimeMs / 5)),
+    intEnv("LIVE_DISCOVERY_PRESEND_RESERVE_MS", 120_000),
+  );
+  const discoveryPhaseRuntimeMs = Math.max(1, maxRuntimeMs - preSendReserveMs);
   const latestBlock = await provider.getBlockNumber();
   const tokenCache = new Map<string, TokenMeta>();
   const stats: DiscoveryStats = {
@@ -1071,58 +1860,173 @@ async function discoverGraph(provider: ethers.JsonRpcProvider) {
     rejectedMetadata: 0,
     rejectedZeroLiquidity: 0,
     rejectedUnsupportedInvariant: 0,
+    rejectedLowTvlEdge: 0,
     rejectedLogScan: 0,
     rejectedPreSend: 0,
+    preSendRejectReasons: {},
+    forcedDiscoveryTokens: 0,
     routeCyclesEnumerated: 0,
     routeCyclesRejectedRepeatedPool: 0,
+    routeCyclesRejectedRepeatedToken: 0,
     routeCyclesRejectedNonFlashloan: 0,
+    routeCyclesRejectedVenueDiversity: 0,
+    routeCyclesRejectedConsecutiveVenue: 0,
+    routeCyclesRejectedTvl: 0,
     routeCyclesRejectedQuote: 0,
+    routeQuoteRejectReasons: {},
+    minRoutePoolTvlUsd: 0,
     truncated: false,
     sourceCounts: {},
   };
   console.log(`LIVE_CYCLE_PHASE|phase=FLASHLOAN_LIQUIDITY_START|block=${latestBlock}`);
-  const flashloanBook = await discoverFlashloanLiquidity(provider, tokenCache, latestBlock);
+  const forcedDiscoveryTokens = await loadForcedDiscoveryTokens(provider, tokenCache);
+  stats.forcedDiscoveryTokens = forcedDiscoveryTokens.length;
+  const flashloanBook = await withBudget(startedAt, maxRuntimeMs, "FLASHLOAN_LIQUIDITY", () =>
+    discoverFlashloanLiquidity(provider, tokenCache, latestBlock)
+  ).catch((error) => {
+    stats.truncated = true;
+    console.log(`LIVE_CYCLE_PHASE|phase=FLASHLOAN_LIQUIDITY_TIMEOUT|error=${String(error?.message || error)}`);
+    return {
+      ordered: [] as FlashloanLiquidity[],
+      byAsset: new Map<string, FlashloanLiquidity[]>(),
+      balancer: [] as FlashloanLiquidity[],
+      aave: [] as FlashloanLiquidity[],
+    };
+  });
   const flashloanAssets = Array.from(new Map(flashloanBook.ordered.map((item) => [item.asset.address.toLowerCase(), item.asset])).values());
+  const discoveryAssets = mergeTokenLists(forcedDiscoveryTokens, flashloanAssets);
   stats.flashloanAssets = flashloanAssets.length;
   stats.flashloanBalancerAssets = flashloanBook.balancer.length;
   stats.flashloanAaveAssets = flashloanBook.aave.length;
   const edges = new Map<string, Edge>();
+  const phaseCheckpoints = boolEnv("LIVE_DISCOVERY_PHASED_CHECKPOINTS", true);
+  const seenPreSend = new Set<string>();
+  const liveEdgeMap = new Map<string, Edge>();
+  const checkpoint = async (phase: string) => {
+    if (!phaseCheckpoints) return;
+    await withBudget(startedAt, maxRuntimeMs, `${phase}_PRESEND`, () =>
+      preSendCheckpoint(provider, tokenCache, Array.from(edges.values()), stats, seenPreSend, liveEdgeMap, phase)
+    ).catch((error) => {
+      stats.truncated = true;
+      console.log(`LIVE_CYCLE_PHASE|phase=${phase}_PRESEND_TIMEOUT|error=${String(error?.message || error)}|checkpointLiveEdges=${liveEdgeMap.size}`);
+    });
+  };
+  const budgetExpired = (phase: string) => {
+    const elapsedMs = Date.now() - startedAt;
+    if (elapsedMs <= maxRuntimeMs) return false;
+    stats.truncated = true;
+    console.log(`LIVE_CYCLE_PHASE|phase=DISCOVERY_BUDGET_STOP|after=${phase}|elapsedMs=${elapsedMs}|maxRuntimeMs=${maxRuntimeMs}|checkpointLiveEdges=${liveEdgeMap.size}`);
+    return true;
+  };
 
-  console.log(`LIVE_CYCLE_PHASE|phase=V2_DISCOVERY_START|flashloanAssets=${flashloanAssets.length}`);
-  await discoverV2(provider, tokenCache, edges, stats, latestBlock, flashloanAssets);
-  console.log(`LIVE_CYCLE_PHASE|phase=V2_DISCOVERY_END|edges=${edges.size}`);
-  console.log("LIVE_CYCLE_PHASE|phase=V3_DISCOVERY_START");
-  await discoverV3(provider, tokenCache, edges, stats, latestBlock, flashloanAssets);
-  console.log(`LIVE_CYCLE_PHASE|phase=V3_DISCOVERY_END|edges=${edges.size}`);
-  console.log("LIVE_CYCLE_PHASE|phase=ALGEBRA_DISCOVERY_START");
-  await discoverAlgebra(provider, tokenCache, edges, stats, latestBlock, flashloanAssets);
-  console.log(`LIVE_CYCLE_PHASE|phase=ALGEBRA_DISCOVERY_END|edges=${edges.size}`);
-  console.log("LIVE_CYCLE_PHASE|phase=CURVE_DISCOVERY_START");
-  await discoverCurve(provider, tokenCache, edges, stats, latestBlock);
-  console.log(`LIVE_CYCLE_PHASE|phase=CURVE_DISCOVERY_END|edges=${edges.size}`);
-  console.log("LIVE_CYCLE_PHASE|phase=BALANCER_DISCOVERY_START");
-  await discoverBalancer(provider, tokenCache, edges, stats, latestBlock);
-  console.log(`LIVE_CYCLE_PHASE|phase=BALANCER_DISCOVERY_END|edges=${edges.size}`);
-
-  const edgeList = Array.from(edges.values());
-  console.log(`LIVE_CYCLE_PHASE|phase=PRICE_DERIVATION_START|edges=${edgeList.length}`);
-  await derivePrices(provider, tokenCache, edgeList);
-  const maxStateAgeBlocks = intEnv("LIVE_ROUTE_MAX_STATE_AGE_BLOCKS", DEFAULT_ROUTE_MAX_STATE_AGE_BLOCKS);
-  const liveEdges: Edge[] = [];
-  console.log(`LIVE_CYCLE_PHASE|phase=PRESEND_REVALIDATION_START|edges=${edgeList.length}`);
-  for (const edge of edgeList) {
-    const result = await preSendRevalidate(provider, edge, maxStateAgeBlocks).catch((error) => ({ ok: false, error: error?.message }));
-    if (!result.ok) {
-      stats.rejectedPreSend += 1;
-      continue;
+  if (boolEnv("LIVE_DISCOVERY_ENABLE_V2", false)) {
+    console.log(`LIVE_CYCLE_PHASE|phase=V2_DISCOVERY_START|flashloanAssets=${flashloanAssets.length}|forcedTokens=${forcedDiscoveryTokens.length}|pairUniverse=${discoveryAssets.length}`);
+    await withBudget(startedAt, discoveryPhaseRuntimeMs, "V2", () =>
+      discoverV2(provider, tokenCache, edges, stats, latestBlock, discoveryAssets)
+    ).catch((error) => {
+      stats.truncated = true;
+      console.log(`LIVE_CYCLE_PHASE|phase=V2_DISCOVERY_TIMEOUT|error=${String(error?.message || error)}|edges=${edges.size}`);
+    });
+    console.log(`LIVE_CYCLE_PHASE|phase=V2_DISCOVERY_END|edges=${edges.size}`);
+    await checkpoint("V2");
+    if (budgetExpired("V2")) {
+      stats.tokens = tokenCache.size;
+      stats.discoveredEdges = liveEdgeMap.size;
+      stats.discoveredPools = new Set(Array.from(liveEdgeMap.values()).map((edge) => edge.poolAddress.toLowerCase())).size;
+      return { latestBlock, tokenCache, flashloanAssets, flashloanBook, edges: Array.from(liveEdgeMap.values()), stats };
     }
-    liveEdges.push(edge);
+  } else {
+    console.log("LIVE_CYCLE_PHASE|phase=V2_DISCOVERY_SKIPPED|reason=V2_COMPATIBILITY_LANE_DISABLED|enableWith=LIVE_DISCOVERY_ENABLE_V2_TRUE");
   }
+  if (boolEnv("LIVE_DISCOVERY_ENABLE_V3", true)) {
+    console.log("LIVE_CYCLE_PHASE|phase=V3_DISCOVERY_START");
+    await withBudget(startedAt, discoveryPhaseRuntimeMs, "V3", () =>
+      discoverV3(provider, tokenCache, edges, stats, latestBlock, discoveryAssets)
+    ).catch((error) => {
+      stats.truncated = true;
+      console.log(`LIVE_CYCLE_PHASE|phase=V3_DISCOVERY_TIMEOUT|error=${String(error?.message || error)}|edges=${edges.size}`);
+    });
+    console.log(`LIVE_CYCLE_PHASE|phase=V3_DISCOVERY_END|edges=${edges.size}`);
+    await checkpoint("V3");
+    if (budgetExpired("V3")) {
+      stats.tokens = tokenCache.size;
+      stats.discoveredEdges = liveEdgeMap.size;
+      stats.discoveredPools = new Set(Array.from(liveEdgeMap.values()).map((edge) => edge.poolAddress.toLowerCase())).size;
+      return { latestBlock, tokenCache, flashloanAssets, flashloanBook, edges: Array.from(liveEdgeMap.values()), stats };
+    }
+  } else {
+    console.log("LIVE_CYCLE_PHASE|phase=V3_DISCOVERY_SKIPPED|reason=VENUE_DISABLED|enableWith=LIVE_DISCOVERY_ENABLE_V3_TRUE");
+  }
+  if (boolEnv("LIVE_DISCOVERY_ENABLE_ALGEBRA", true)) {
+    console.log("LIVE_CYCLE_PHASE|phase=ALGEBRA_DISCOVERY_START");
+    await withBudget(startedAt, discoveryPhaseRuntimeMs, "ALGEBRA", () =>
+      discoverAlgebra(provider, tokenCache, edges, stats, latestBlock, discoveryAssets)
+    ).catch((error) => {
+      stats.truncated = true;
+      console.log(`LIVE_CYCLE_PHASE|phase=ALGEBRA_DISCOVERY_TIMEOUT|error=${String(error?.message || error)}|edges=${edges.size}`);
+    });
+    console.log(`LIVE_CYCLE_PHASE|phase=ALGEBRA_DISCOVERY_END|edges=${edges.size}`);
+    await checkpoint("ALGEBRA");
+    if (budgetExpired("ALGEBRA")) {
+      stats.tokens = tokenCache.size;
+      stats.discoveredEdges = liveEdgeMap.size;
+      stats.discoveredPools = new Set(Array.from(liveEdgeMap.values()).map((edge) => edge.poolAddress.toLowerCase())).size;
+      return { latestBlock, tokenCache, flashloanAssets, flashloanBook, edges: Array.from(liveEdgeMap.values()), stats };
+    }
+  } else {
+    console.log("LIVE_CYCLE_PHASE|phase=ALGEBRA_DISCOVERY_SKIPPED|reason=VENUE_DISABLED|enableWith=LIVE_DISCOVERY_ENABLE_ALGEBRA_TRUE");
+  }
+  if (boolEnv("LIVE_DISCOVERY_ENABLE_CURVE", true)) {
+    console.log("LIVE_CYCLE_PHASE|phase=CURVE_DISCOVERY_START");
+    await withBudget(startedAt, discoveryPhaseRuntimeMs, "CURVE", () =>
+      discoverCurve(provider, tokenCache, edges, stats, latestBlock)
+    ).catch((error) => {
+      stats.truncated = true;
+      console.log(`LIVE_CYCLE_PHASE|phase=CURVE_DISCOVERY_TIMEOUT|error=${String(error?.message || error)}|edges=${edges.size}`);
+    });
+    console.log(`LIVE_CYCLE_PHASE|phase=CURVE_DISCOVERY_END|edges=${edges.size}`);
+    await checkpoint("CURVE");
+    if (budgetExpired("CURVE")) {
+      stats.tokens = tokenCache.size;
+      stats.discoveredEdges = liveEdgeMap.size;
+      stats.discoveredPools = new Set(Array.from(liveEdgeMap.values()).map((edge) => edge.poolAddress.toLowerCase())).size;
+      return { latestBlock, tokenCache, flashloanAssets, flashloanBook, edges: Array.from(liveEdgeMap.values()), stats };
+    }
+  } else {
+    console.log("LIVE_CYCLE_PHASE|phase=CURVE_DISCOVERY_SKIPPED|reason=VENUE_DISABLED|enableWith=LIVE_DISCOVERY_ENABLE_CURVE_TRUE");
+  }
+  if (boolEnv("LIVE_DISCOVERY_ENABLE_BALANCER", true)) {
+    console.log("LIVE_CYCLE_PHASE|phase=BALANCER_DISCOVERY_START");
+    await withBudget(startedAt, discoveryPhaseRuntimeMs, "BALANCER", () =>
+      discoverBalancer(provider, tokenCache, edges, stats, latestBlock)
+    ).catch((error) => {
+      stats.truncated = true;
+      console.log(`LIVE_CYCLE_PHASE|phase=BALANCER_DISCOVERY_TIMEOUT|error=${String(error?.message || error)}|edges=${edges.size}`);
+    });
+    console.log(`LIVE_CYCLE_PHASE|phase=BALANCER_DISCOVERY_END|edges=${edges.size}`);
+    await checkpoint("BALANCER");
+  } else {
+    console.log("LIVE_CYCLE_PHASE|phase=BALANCER_DISCOVERY_SKIPPED|reason=VENUE_DISABLED|enableWith=LIVE_DISCOVERY_ENABLE_BALANCER_TRUE");
+  }
+
+  if (!phaseCheckpoints) {
+    await preSendCheckpoint(provider, tokenCache, Array.from(edges.values()), stats, seenPreSend, liveEdgeMap, "FINAL");
+  }
+  const liveEdges = Array.from(liveEdgeMap.values());
   stats.tokens = tokenCache.size;
   stats.discoveredEdges = liveEdges.length;
   stats.discoveredPools = new Set(liveEdges.map((edge) => edge.poolAddress.toLowerCase())).size;
   console.log(`LIVE_CYCLE_PHASE|phase=DISCOVERY_GRAPH_END|liveEdges=${liveEdges.length}|tokens=${tokenCache.size}`);
   return { latestBlock, tokenCache, flashloanAssets, flashloanBook, edges: liveEdges, stats };
+}
+
+export async function discoverProductionPoolData(options: {
+  provider?: ethers.JsonRpcProvider;
+} = {}) {
+  const provider = options.provider || new ethers.JsonRpcProvider(rpcUrl(), Number(CHAIN_ID), { staticNetwork: true });
+  const network = await provider.getNetwork();
+  if (network.chainId !== CHAIN_ID) throw new Error(`CHAIN_ID_MISMATCH:${network.chainId}`);
+  return await discoverGraph(provider);
 }
 
 async function quoteEdge(provider: ethers.JsonRpcProvider, edge: Edge, amountIn: bigint) {
@@ -1131,6 +2035,7 @@ async function quoteEdge(provider: ethers.JsonRpcProvider, edge: Edge, amountIn:
   }
   if (edge.invariant === "V3_CONCENTRATED_LIQUIDITY") {
     return await quoteV3ExactInputSingle(provider, {
+      quoter: edge.extra?.v3Quoter,
       tokenIn: edge.tokenIn,
       tokenOut: edge.tokenOut,
       fee: edge.extra?.v3Fee || edge.feeBps * 100,
@@ -1139,6 +2044,7 @@ async function quoteEdge(provider: ethers.JsonRpcProvider, edge: Edge, amountIn:
   }
   if (edge.invariant === "ALGEBRA_CONCENTRATED_LIQUIDITY") {
     return await quoteAlgebraExactInputSingle(provider, {
+      quoter: edge.extra?.algebraQuoter,
       tokenIn: edge.tokenIn,
       tokenOut: edge.tokenOut,
       amountIn,
@@ -1178,66 +2084,6 @@ async function quoteEdge(provider: ethers.JsonRpcProvider, edge: Edge, amountIn:
   throw new Error(`UNSUPPORTED_INVARIANT:${edge.invariant}`);
 }
 
-function buildStepCalldata(edge: Edge, amountIn: bigint, minAmountOut: bigint, targetContract: string, deadline: number) {
-  if (edge.invariant === "V2_CPMM") {
-    return buildV2SwapCalldata(amountIn, minAmountOut, [edge.tokenIn, edge.tokenOut], targetContract, deadline);
-  }
-  if (edge.invariant === "V3_CONCENTRATED_LIQUIDITY") {
-    return buildV3ExactInputSingleCalldata({
-      tokenIn: edge.tokenIn,
-      tokenOut: edge.tokenOut,
-      fee: edge.extra?.v3Fee || edge.feeBps * 100,
-      receiver: targetContract,
-      deadline,
-      amountIn,
-      minAmountOut,
-    });
-  }
-  if (edge.invariant === "ALGEBRA_CONCENTRATED_LIQUIDITY") {
-    return buildAlgebraExactInputSingleCalldata({
-      tokenIn: edge.tokenIn,
-      tokenOut: edge.tokenOut,
-      receiver: targetContract,
-      deadline,
-      amountIn,
-      minAmountOut,
-    });
-  }
-  if (edge.invariant === "CURVE_STABLE_SWAP") {
-    return buildCurveRouterExchangeCalldata({
-      pool: edge.poolAddress,
-      tokenIn: edge.tokenIn,
-      tokenOut: edge.tokenOut,
-      amountIn,
-      minAmountOut,
-      receiver: targetContract,
-    });
-  }
-  if (edge.invariant === "BALANCER_WEIGHTED") {
-    if (!edge.poolId) throw new Error("BALANCER_POOL_ID_MISSING");
-    return buildBalancerSingleSwapCalldata({
-      poolId: edge.poolId,
-      tokenIn: edge.tokenIn,
-      tokenOut: edge.tokenOut,
-      amountIn,
-      minAmountOut,
-      sender: targetContract,
-      receiver: targetContract,
-      deadline,
-    });
-  }
-  if (edge.invariant === "STABLE_SWAP") {
-    if (edge.tokenInIndex === undefined || edge.tokenOutIndex === undefined) throw new Error("STABLE_SWAP_INDEX_MISSING");
-    return buildStableSwapExchangeCalldata({
-      i: edge.tokenInIndex,
-      j: edge.tokenOutIndex,
-      amountIn,
-      minAmountOut,
-    });
-  }
-  throw new Error(`CALldata_UNSUPPORTED_INVARIANT:${edge.invariant}`);
-}
-
 function reverseEdge(edge: Edge): Edge {
   const extra = edge.extra ? { ...edge.extra } : undefined;
   if (extra?.balancerWeightIn !== undefined || extra?.balancerWeightOut !== undefined) {
@@ -1264,6 +2110,50 @@ function reverseEdge(edge: Edge): Edge {
   };
 }
 
+function reverseRoute(route: Edge[]) {
+  return [...route].reverse().map((edge) => reverseEdge(edge));
+}
+
+function routeFingerprint(route: Edge[]) {
+  return route.map((edge) => `${edge.dexId}:${edge.poolAddress}:${edge.tokenIn}->${edge.tokenOut}:${edge.invariant}`).join("|").toLowerCase();
+}
+
+function routeVenueKeys(route: Edge[]) {
+  return route.map((edge) => edge.dexId.toUpperCase());
+}
+
+function uniqueRouteVenues(route: Edge[]) {
+  return new Set(routeVenueKeys(route));
+}
+
+function routeVenueDiversityOk(route: Edge[]) {
+  if (!boolEnv("LIVE_ROUTE_REQUIRE_CROSS_VENUE", true)) return true;
+  const minUniqueVenues = Math.max(1, intEnv("LIVE_ROUTE_MIN_UNIQUE_VENUES", 2));
+  return uniqueRouteVenues(route).size >= minUniqueVenues;
+}
+
+function routeConsecutiveVenueOk(route: Edge[]) {
+  if (!boolEnv("LIVE_ROUTE_REJECT_CONSECUTIVE_SAME_VENUE", true)) return true;
+  for (let index = 1; index < route.length; index += 1) {
+    if (route[index - 1].dexId.toUpperCase() === route[index].dexId.toUpperCase()) return false;
+  }
+  return true;
+}
+
+function quoteRoutePriority(route: Edge[]) {
+  const lowestPoolTvlUsd = Math.min(...route.map((edge) => edge.tvlUsd).filter((value) => Number.isFinite(value) && value > 0));
+  const pricedEdges = route.filter((edge) => Number.isFinite(edge.tokenInPriceUsd) || Number.isFinite(edge.tokenOutPriceUsd)).length;
+  const venueDiversityBonus = uniqueRouteVenues(route).size * 20_000;
+  const invariantBonus = route.reduce((sum, edge) => {
+    if (edge.invariant === "V2_CPMM") return sum + 1;
+    if (edge.invariant === "CURVE_STABLE_SWAP" || edge.invariant === "STABLE_SWAP") return sum + 2;
+    if (edge.invariant === "BALANCER_WEIGHTED") return sum + 2;
+    return sum + 3;
+  }, 0);
+  const routeLengthPenalty = route.length * 250;
+  return (Number.isFinite(lowestPoolTvlUsd) ? lowestPoolTvlUsd : 0) + pricedEdges * 10_000 + venueDiversityBonus + invariantBonus * 1_000 - routeLengthPenalty;
+}
+
 function buildAdjacency(edges: Edge[]) {
   const byIn = new Map<string, Edge[]>();
   for (const edge of edges) {
@@ -1275,44 +2165,153 @@ function buildAdjacency(edges: Edge[]) {
   return byIn;
 }
 
+function sameUndirectedPair(left: Edge, right: Edge) {
+  return (sameAddress(left.tokenIn, right.tokenIn) && sameAddress(left.tokenOut, right.tokenOut))
+    || (sameAddress(left.tokenIn, right.tokenOut) && sameAddress(left.tokenOut, right.tokenIn));
+}
+
 function enumerateCycles(flashloanAssets: TokenMeta[], edges: Edge[], stats: DiscoveryStats) {
   const byIn = buildAdjacency(edges);
-  const maxHops = Math.max(2, Math.min(4, intEnv("MAX_ROUTE_HOPS", 4)));
+  const maxHops = Math.max(2, Math.min(6, intEnv("MAX_ROUTE_HOPS", 4)));
   const maxCycles = intEnv("LIVE_ROUTE_MAX_CYCLES", DEFAULT_ROUTE_MAX_CYCLES);
+  const configuredMaxCyclesPerAsset = optionalIntEnv("LIVE_ROUTE_MAX_CYCLES_PER_ASSET");
   const cycles: Edge[][] = [];
+  const seenCycles = new Set<string>();
   const flashSet = new Set(flashloanAssets.map((asset) => asset.address.toLowerCase()));
+  const orderedAssets = [...flashloanAssets].sort((left, right) => {
+    const rightDegree = (byIn.get(right.address.toLowerCase()) || []).length;
+    const leftDegree = (byIn.get(left.address.toLowerCase()) || []).length;
+    return rightDegree - leftDegree;
+  });
+  const pushCycle = (route: Edge[]) => {
+    if (cycles.length >= maxCycles) {
+      stats.truncated = true;
+      return false;
+    }
+    if (!routeVenueDiversityOk(route)) {
+      stats.routeCyclesRejectedVenueDiversity += 1;
+      return false;
+    }
+    if (!routeConsecutiveVenueOk(route)) {
+      stats.routeCyclesRejectedConsecutiveVenue += 1;
+      return false;
+    }
+    const fingerprint = routeFingerprint(route);
+    if (seenCycles.has(fingerprint)) return false;
+    seenCycles.add(fingerprint);
+    cycles.push([...route]);
+    stats.routeCyclesEnumerated += 1;
+    return true;
+  };
 
-  for (const asset of flashloanAssets) {
-    const walk = (currentToken: string, route: Edge[], usedPools: Set<string>) => {
-      if (maxCycles !== undefined && cycles.length >= maxCycles) {
+  for (let assetIndex = 0; assetIndex < orderedAssets.length; assetIndex += 1) {
+    const asset = orderedAssets[assetIndex];
+    const remainingAssets = orderedAssets.length - assetIndex;
+    const remainingCycleBudget = Math.max(0, maxCycles - cycles.length);
+    if (remainingCycleBudget <= 0) {
+      stats.truncated = true;
+      break;
+    }
+    const maxCyclesPerAsset = configuredMaxCyclesPerAsset ?? Math.max(1, Math.ceil(remainingCycleBudget / Math.max(1, remainingAssets)));
+    let assetCycleCount = 0;
+    const incrementAssetCycle = (route: Edge[]) => {
+      if (assetCycleCount >= maxCyclesPerAsset) {
+        stats.truncated = true;
+        return false;
+      }
+      const pushed = pushCycle(route);
+      if (pushed) assetCycleCount += 1;
+      return pushed;
+    };
+    if (!flashSet.has(asset.address.toLowerCase())) {
+      stats.routeCyclesRejectedNonFlashloan += 1;
+      continue;
+    }
+
+    if (boolEnv("LIVE_ROUTE_PRIORITIZE_CROSS_VENUE_DOCTRINE", true)) {
+      const firstLegs = byIn.get(asset.address.toLowerCase()) || [];
+      for (const leg1 of firstLegs) {
+        if (cycles.length >= maxCycles || assetCycleCount >= maxCyclesPerAsset) break;
+        for (const leg2 of byIn.get(leg1.tokenOut.toLowerCase()) || []) {
+          if (!sameAddress(leg2.tokenOut, asset.address)) continue;
+          if (leg1.poolAddress.toLowerCase() === leg2.poolAddress.toLowerCase()) continue;
+          if (leg1.dexId.toUpperCase() === leg2.dexId.toUpperCase()) {
+            stats.routeCyclesRejectedVenueDiversity += 1;
+            continue;
+          }
+          if (!sameUndirectedPair(leg1, leg2)) continue;
+          incrementAssetCycle([leg1, leg2]);
+        }
+      }
+
+      if (maxHops >= 3) {
+        for (const leg1 of firstLegs) {
+          if (cycles.length >= maxCycles || assetCycleCount >= maxCyclesPerAsset) break;
+          for (const leg2 of byIn.get(leg1.tokenOut.toLowerCase()) || []) {
+            if (cycles.length >= maxCycles || assetCycleCount >= maxCyclesPerAsset) break;
+            if (sameAddress(leg2.tokenOut, asset.address) || sameAddress(leg2.tokenOut, leg1.tokenIn)) continue;
+            if (leg1.poolAddress.toLowerCase() === leg2.poolAddress.toLowerCase()) continue;
+            if (leg1.dexId.toUpperCase() === leg2.dexId.toUpperCase()) {
+              stats.routeCyclesRejectedConsecutiveVenue += 1;
+              continue;
+            }
+            for (const leg3 of byIn.get(leg2.tokenOut.toLowerCase()) || []) {
+              if (!sameAddress(leg3.tokenOut, asset.address)) continue;
+              if (new Set([leg1.poolAddress.toLowerCase(), leg2.poolAddress.toLowerCase(), leg3.poolAddress.toLowerCase()]).size < 3) continue;
+              incrementAssetCycle([leg1, leg2, leg3]);
+            }
+          }
+        }
+      }
+
+      if (boolEnv("LIVE_ROUTE_ONLY_DOCTRINE_CYCLES", true)) continue;
+    }
+
+    const walk = (currentToken: string, route: Edge[], usedPools: Set<string>, usedTokens: Set<string>) => {
+      if (cycles.length >= maxCycles || assetCycleCount >= maxCyclesPerAsset) {
         stats.truncated = true;
         return;
       }
       if (route.length >= 2 && sameAddress(currentToken, asset.address)) {
-        cycles.push([...route]);
-        stats.routeCyclesEnumerated += 1;
+        if (!routeVenueDiversityOk(route)) {
+          stats.routeCyclesRejectedVenueDiversity += 1;
+          return;
+        }
+        if (!routeConsecutiveVenueOk(route)) {
+          stats.routeCyclesRejectedConsecutiveVenue += 1;
+          return;
+        }
+        incrementAssetCycle(route);
       }
       if (route.length >= maxHops) return;
       for (const edge of byIn.get(currentToken.toLowerCase()) || []) {
+        const tokenOutKey = edge.tokenOut.toLowerCase();
+        const previousEdge = route[route.length - 1];
+        if (previousEdge && boolEnv("LIVE_ROUTE_REJECT_CONSECUTIVE_SAME_VENUE", true) && previousEdge.dexId.toUpperCase() === edge.dexId.toUpperCase()) {
+          stats.routeCyclesRejectedConsecutiveVenue += 1;
+          continue;
+        }
         if (usedPools.has(edge.poolAddress.toLowerCase())) {
           stats.routeCyclesRejectedRepeatedPool += 1;
+          continue;
+        }
+        if (!sameAddress(edge.tokenOut, asset.address) && usedTokens.has(tokenOutKey)) {
+          stats.routeCyclesRejectedRepeatedToken += 1;
           continue;
         }
         if (route.length + 1 === maxHops && !sameAddress(edge.tokenOut, asset.address)) {
           continue;
         }
         usedPools.add(edge.poolAddress.toLowerCase());
+        usedTokens.add(tokenOutKey);
         route.push(edge);
-        walk(edge.tokenOut, route, usedPools);
+        walk(edge.tokenOut, route, usedPools, usedTokens);
         route.pop();
+        usedTokens.delete(tokenOutKey);
         usedPools.delete(edge.poolAddress.toLowerCase());
       }
     };
-    if (!flashSet.has(asset.address.toLowerCase())) {
-      stats.routeCyclesRejectedNonFlashloan += 1;
-      continue;
-    }
-    walk(asset.address, [], new Set());
+    walk(asset.address, [], new Set(), new Set([asset.address.toLowerCase()]));
   }
   return cycles;
 }
@@ -1335,100 +2334,204 @@ async function quoteCandidate(
   if (!Number.isFinite(lowestPoolTvlUsd) || lowestPoolTvlUsd <= 0 || !flashloanAsset.priceUsd) {
     throw new Error("ROUTE_TVL_OR_PRICE_UNRESOLVED");
   }
-  const targetAmountIn = floatToRaw((lowestPoolTvlUsd * numberEnv("SIM_MAX_FLASH_TVL_FRACTION", 0.15)) / flashloanAsset.priceUsd, flashloanAsset.decimals);
-  const flashloanLiquidity = liquidityOptions.find((item) => item.liquidity >= targetAmountIn) || liquidityOptions[0];
-  const amountIn = targetAmountIn <= flashloanLiquidity.liquidity ? targetAmountIn : flashloanLiquidity.liquidity;
-  if (amountIn <= 0n) throw new Error("FLASHLOAN_SIZE_ZERO");
-  const flashFeeRaw = amountIn * flashloanLiquidity.feeBps / 10000n;
   const slippageBps = BigInt(Math.floor(numberEnv("SLIPPAGE_BPS", 10)));
+  const quoteEdgeTimeoutMs = intEnv("LIVE_QUOTE_EDGE_TIMEOUT_MS", intEnv("LIVE_RPC_CALL_TIMEOUT_MS", DEFAULT_RPC_CALL_TIMEOUT_MS));
   const deadline = Math.floor(Date.now() / 1000) + intEnv("EXECUTION_SUBMISSION_EXPIRY_SECONDS", 300);
-
-  let amount = amountIn;
-  const steps: RouteQuoteStep[] = [];
-  for (let legIndex = 0; legIndex < route.length; legIndex += 1) {
-    const edge = route[legIndex];
-    const team = legIndex === 0 ? "LEG1_MATH" : "LEG2_PLUS_MATH";
-    void recordLaneEvent({
-      laneId,
-      team,
-      phase: "QUOTE_START",
-      legIndex,
-      invariant: edge.invariant,
-      poolAddress: edge.poolAddress,
-      tokenIn: edge.tokenInSymbol,
-      tokenOut: edge.tokenOutSymbol,
-      at: Date.now(),
-    });
-    const amountOut = await quoteEdge(provider, edge, amount);
-    if (amountOut <= 0n) throw new Error("QUOTE_ZERO_OUTPUT");
-    const minAmountOut = bpsMin(amountOut, slippageBps);
-    const calldata = buildStepCalldata(edge, amount, minAmountOut, targetContract, deadline);
-    steps.push({ edge, amountIn: amount, amountOut, minAmountOut, calldata });
-    amount = amountOut;
-    void recordLaneEvent({
-      laneId,
-      team,
-      phase: "QUOTE_END",
-      legIndex,
-      amountOut,
-      at: Date.now(),
-    });
+  const maxFlashTvlFraction = numberEnv("SIM_MAX_FLASH_TVL_FRACTION", 0.15);
+  const riskBufferUsd = numberEnv("RISK_BUFFER_USD", 0);
+  const requiredPremiumUsd = gasCostUsd + riskBufferUsd + minProfitUsd;
+  const {
+    candidatesUsd,
+    economicMinTradeUsd,
+    maxScannableTradeUsd,
+    profitabilityTargetEdgeBps,
+    economicSizeOk,
+  } = buildSizeUsdCandidates(lowestPoolTvlUsd, maxFlashTvlFraction, requiredPremiumUsd);
+  if (boolEnv("LIVE_ENFORCE_ECONOMIC_MIN_FLASH", false) && !economicSizeOk) {
+    throw new Error(`ECONOMIC_SIZE_CAP:${maxScannableTradeUsd.toFixed(6)}<${economicMinTradeUsd.toFixed(6)}@${profitabilityTargetEdgeBps}bps`);
   }
 
-  const amountOut = amount;
-  const grossProfitRaw = amountOut - amountIn;
-  const repaymentRaw = amountIn + flashFeeRaw;
-  const grossProfitUsd = quoteUsd(grossProfitRaw, flashloanAsset);
-  const flashFeeUsd = quoteUsd(flashFeeRaw, flashloanAsset);
-  const netProfitUsd = grossProfitUsd === undefined || flashFeeUsd === undefined
-    ? undefined
-    : grossProfitUsd - flashFeeUsd - gasCostUsd - numberEnv("RISK_BUFFER_USD", 0);
-  const status = amountOut > repaymentRaw && netProfitUsd !== undefined && netProfitUsd >= minProfitUsd
-    ? "EXECUTABLE_PROFIT_CANDIDATE"
-    : "REJECTED_NO_PROFIT";
-  const rejectionReason = status === "EXECUTABLE_PROFIT_CANDIDATE"
-    ? "NONE"
-    : `NET_PROFIT_BELOW_MIN:${netProfitUsd === undefined ? "UNPRICED" : netProfitUsd.toFixed(6)}<${minProfitUsd}`;
+  let best: Candidate | null = null;
+  const seenAmounts = new Set<string>();
+  const sizeSearchCandidatesUsd: number[] = [];
 
-  return {
-    routeId: "",
-    status,
-    flashloanAsset,
-    flashloanLiquidity,
-    path: route.map((edge) => tokenCache.get(edge.tokenIn.toLowerCase())).filter(Boolean) as TokenMeta[],
-    steps,
-    amountIn,
-    amountOut,
-    grossProfitRaw,
-    grossProfitUsd,
-    gasCostUsd,
-    flashFeeRaw,
-    flashFeeUsd,
-    netProfitUsd,
-    lowestPoolTvlUsd,
-    rejectionReason,
-  } satisfies Candidate;
+  for (const targetUsd of candidatesUsd) {
+    const targetAmountIn = floatToRaw(targetUsd / flashloanAsset.priceUsd, flashloanAsset.decimals);
+    const flashloanLiquidity = liquidityOptions.find((item) => item.liquidity >= targetAmountIn) || liquidityOptions[0];
+    const amountIn = targetAmountIn <= flashloanLiquidity.liquidity ? targetAmountIn : flashloanLiquidity.liquidity;
+    if (amountIn <= 0n || seenAmounts.has(amountIn.toString())) continue;
+    seenAmounts.add(amountIn.toString());
+    sizeSearchCandidatesUsd.push(targetUsd);
+    const flashFeeRaw = amountIn * flashloanLiquidity.feeBps / 10000n;
+
+    let amount = amountIn;
+    const steps: Array<Omit<RouteQuoteStep, "calldata">> = [];
+    for (let legIndex = 0; legIndex < route.length; legIndex += 1) {
+      const edge = route[legIndex];
+      const team = legIndex === 0 ? "LEG1_MATH" : "LEG2_PLUS_MATH";
+      void recordLaneEvent({
+        laneId,
+        team,
+        phase: "QUOTE_START",
+        legIndex,
+        invariant: edge.invariant,
+        poolAddress: edge.poolAddress,
+        tokenIn: edge.tokenInSymbol,
+        tokenOut: edge.tokenOutSymbol,
+        at: Date.now(),
+      });
+      const amountOut = await withTimeout(
+        quoteEdge(provider, edge, amount),
+        quoteEdgeTimeoutMs,
+        `QUOTE_${edge.invariant}`,
+      );
+      if (amountOut <= 0n) throw new Error("QUOTE_ZERO_OUTPUT");
+      const minAmountOut = bpsMin(amountOut, slippageBps);
+      steps.push({ edge, amountIn: amount, amountOut, minAmountOut });
+      amount = amountOut;
+      void recordLaneEvent({
+        laneId,
+        team,
+        phase: "QUOTE_END",
+        legIndex,
+        amountOut,
+        at: Date.now(),
+      });
+    }
+
+    const amountOut = amount;
+    const grossProfitRaw = amountOut - amountIn;
+    const repaymentRaw = amountIn + flashFeeRaw;
+    const routeSteps = buildRouteCalldataFromQuote({
+      steps,
+      flashloanAsset: flashloanAsset.address,
+      receiver: targetContract,
+      deadline,
+    }) as RouteQuoteStep[];
+    const priceVariance = evaluatePriceVarianceGate(routeSteps, flashloanAsset, grossProfitRaw);
+    const grossProfitUsd = quoteUsd(grossProfitRaw, flashloanAsset);
+    const flashFeeUsd = quoteUsd(flashFeeRaw, flashloanAsset);
+    const requiredPremiumRaw = usdToRawCeil(requiredPremiumUsd, flashloanAsset);
+    const requiredOutputRaw = requiredPremiumRaw === undefined ? undefined : repaymentRaw + requiredPremiumRaw;
+    const repaymentUsd = quoteUsd(repaymentRaw, flashloanAsset);
+    const requiredOutputUsd = requiredOutputRaw === undefined ? undefined : quoteUsd(requiredOutputRaw, flashloanAsset);
+    const executableSurplusRaw = requiredOutputRaw === undefined ? undefined : amountOut - requiredOutputRaw;
+    const executableSurplusUsd = executableSurplusRaw === undefined ? undefined : quoteUsd(executableSurplusRaw, flashloanAsset);
+    const netProfitUsd = grossProfitUsd === undefined || flashFeeUsd === undefined
+      ? undefined
+      : grossProfitUsd - flashFeeUsd - gasCostUsd - riskBufferUsd;
+    const thresholdOk = requiredOutputRaw !== undefined && amountOut > requiredOutputRaw;
+    const status = priceVariance.ok && thresholdOk && netProfitUsd !== undefined && netProfitUsd >= minProfitUsd
+      ? "EXECUTABLE_PROFIT_CANDIDATE"
+      : "REJECTED_NO_PROFIT";
+    const rejectionReason = status === "EXECUTABLE_PROFIT_CANDIDATE"
+      ? "NONE"
+      : !priceVariance.ok
+        ? priceVariance.reason
+      : requiredOutputRaw === undefined || netProfitUsd === undefined
+        ? "EXECUTABLE_THRESHOLD_UNPRICED"
+      : !thresholdOk
+        ? `OUTPUT_BELOW_EXECUTABLE_THRESHOLD:${ethers.formatUnits(amountOut, flashloanAsset.decimals)}<=${ethers.formatUnits(requiredOutputRaw, flashloanAsset.decimals)}|deficitUsd=${Math.abs(executableSurplusUsd ?? 0).toFixed(6)}`
+      : `NET_PROFIT_BELOW_MIN:${netProfitUsd.toFixed(6)}<${minProfitUsd}`;
+    const candidate = {
+      routeId: "",
+      status,
+      flashloanAsset,
+      flashloanLiquidity,
+      path: route.map((edge) => tokenCache.get(edge.tokenIn.toLowerCase())).filter(Boolean) as TokenMeta[],
+      steps: routeSteps,
+      amountIn,
+      amountOut,
+      repaymentRaw,
+      repaymentUsd,
+      requiredOutputRaw,
+      requiredOutputUsd,
+      executableSurplusRaw,
+      executableSurplusUsd,
+      grossProfitRaw,
+      grossProfitUsd,
+      gasCostUsd,
+      economicMinTradeUsd,
+      maxScannableTradeUsd,
+      profitabilityTargetEdgeBps,
+      economicSizeOk,
+      flashFeeRaw,
+      flashFeeUsd,
+      riskBufferUsd,
+      minProfitUsd,
+      requiredPremiumUsd,
+      netProfitUsd,
+      lowestPoolTvlUsd,
+      rejectionReason,
+      sizingRule: "ECONOMIC_SIZE_LADDER: fractions + min economic trade + max route cap, capped by provider liquidity",
+      sizeSearchCandidatesUsd: [...sizeSearchCandidatesUsd],
+      priceVariance,
+    } satisfies Candidate;
+    if (!best || (candidate.netProfitUsd ?? Number.NEGATIVE_INFINITY) > (best.netProfitUsd ?? Number.NEGATIVE_INFINITY)) {
+      best = candidate;
+    }
+  }
+
+  if (!best) throw new Error("FLASHLOAN_SIZE_ZERO");
+  best.sizeSearchCandidatesUsd = sizeSearchCandidatesUsd;
+  return best;
 }
 
 async function rankCandidates(provider: ethers.JsonRpcProvider, tokenCache: Map<string, TokenMeta>, flashloanBook: Map<string, FlashloanLiquidity[]>, flashloanAssets: TokenMeta[], edges: Edge[], stats: DiscoveryStats, targetContract: string) {
   const cycles = enumerateCycles(flashloanAssets, edges, stats);
+  const autoReverseEnabled = boolEnv("LIVE_ROUTE_AUTO_REVERSE", true);
+  const quoteRoutes: Array<{ route: Edge[]; index: number; orientation: "DIRECT" | "AUTO_REVERSE"; reverseOf?: number; priority: number }> = [];
+  const seenRouteFingerprints = new Set<string>();
+  cycles.forEach((route, index) => {
+    const directFingerprint = routeFingerprint(route);
+    if (!seenRouteFingerprints.has(directFingerprint)) {
+      seenRouteFingerprints.add(directFingerprint);
+      quoteRoutes.push({ route, index, orientation: "DIRECT", priority: quoteRoutePriority(route) });
+    }
+    if (autoReverseEnabled) {
+      const reversed = reverseRoute(route);
+      const reverseFingerprint = routeFingerprint(reversed);
+      if (!seenRouteFingerprints.has(reverseFingerprint)) {
+        seenRouteFingerprints.add(reverseFingerprint);
+        quoteRoutes.push({ route: reversed, index, orientation: "AUTO_REVERSE", reverseOf: index, priority: quoteRoutePriority(reversed) });
+      }
+    }
+  });
+  quoteRoutes.sort((left, right) => right.priority - left.priority || left.route.length - right.route.length || left.index - right.index);
   const gasPrice = await provider.getFeeData().then((fee) => fee.gasPrice || 0n).catch(() => 0n);
   const nativeUsd = numberEnv("NATIVE_TOKEN_USD", 1);
   const estimatedGasUnits = BigInt(intEnv("ESTIMATED_GAS_UNITS", 450000));
   const gasCostUsd = Number(estimatedGasUnits * gasPrice) / 1e18 * nativeUsd;
   const minProfitUsd = numberEnv("MIN_NET_PROFIT_USD", 5);
+  const minRoutePoolTvlUsd = numberEnv("ROUTE_MIN_POOL_TVL_USD", numberEnv("MIN_POOL_TVL_USD", 5000));
+  stats.minRoutePoolTvlUsd = minRoutePoolTvlUsd;
   const candidates: Candidate[] = [];
   const quoteLanes = intEnv("LIVE_QUOTE_LANES", DEFAULT_QUOTE_LANES);
+  const routeQuoteTimeoutMs = intEnv("LIVE_ROUTE_QUOTE_TIMEOUT_MS", 45_000);
   const leg1Helpers = Math.max(1, Math.floor(quoteLanes / 2));
   const leg2Helpers = Math.max(1, quoteLanes - leg1Helpers);
-  console.log(`LANE_TEAM_SUMMARY|quoteLanes=${quoteLanes}|leg1Helpers=${leg1Helpers}|leg2PlusHelpers=${leg2Helpers}|cycles=${cycles.length}|dependency=LEG2_REQUIRES_LEG1_OUTPUT`);
+  console.log(`LANE_TEAM_SUMMARY|quoteLanes=${quoteLanes}|leg1Helpers=${leg1Helpers}|leg2PlusHelpers=${leg2Helpers}|cycles=${cycles.length}|quoteRoutes=${quoteRoutes.length}|autoReverse=${autoReverseEnabled}|minRoutePoolTvlUsd=${minRoutePoolTvlUsd}|dependency=LEG2_REQUIRES_LEG1_OUTPUT`);
 
-  await runWithConcurrency(cycles.map((route, index) => ({ route, index })), quoteLanes, async ({ route, index }) => {
+  await runWithConcurrency(quoteRoutes, quoteLanes, async ({ route, index, orientation, reverseOf }) => {
     try {
+      const lowestPoolTvlUsd = Math.min(...route.map((edge) => edge.tvlUsd).filter((value) => Number.isFinite(value) && value > 0));
+      if (!Number.isFinite(lowestPoolTvlUsd) || lowestPoolTvlUsd < minRoutePoolTvlUsd) {
+        stats.routeCyclesRejectedTvl += 1;
+        return;
+      }
       const laneId = index % quoteLanes;
-      candidates.push(await quoteCandidate(provider, tokenCache, flashloanBook, route, targetContract, gasCostUsd, minProfitUsd, laneId));
-    } catch {
+      const candidate = await withTimeout(
+        quoteCandidate(provider, tokenCache, flashloanBook, route, targetContract, gasCostUsd, minProfitUsd, laneId),
+        routeQuoteTimeoutMs,
+        "ROUTE_QUOTE",
+      );
+      candidate.routeOrientation = orientation;
+      candidate.reverseOf = reverseOf === undefined ? undefined : `cycle-${reverseOf}`;
+      candidates.push(candidate);
+    } catch (error: any) {
       stats.routeCyclesRejectedQuote += 1;
+      const reason = String(error?.reason || error?.shortMessage || error?.message || "ROUTE_QUOTE_REJECTED").slice(0, 160);
+      stats.routeQuoteRejectReasons[reason] = (stats.routeQuoteRejectReasons[reason] || 0) + 1;
     }
   });
 
@@ -1450,7 +2553,7 @@ async function rankCandidates(provider: ethers.JsonRpcProvider, tokenCache: Map<
   return { candidates, gasCostUsd, minProfitUsd };
 }
 
-function candidateToLedgerPayload(candidate: Candidate) {
+export function candidateToLedgerPayload(candidate: Candidate) {
   return {
     routeId: candidate.routeId,
     payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
@@ -1461,23 +2564,90 @@ function candidateToLedgerPayload(candidate: Candidate) {
     path: routePath(candidate),
     venues: routeVenues(candidate),
     hops: candidate.steps.length,
+    routeOrientation: candidate.routeOrientation || "DIRECT",
+    reverseOf: candidate.reverseOf,
     flashloanAsset: candidate.flashloanAsset.address,
     flashloanSymbol: candidate.flashloanAsset.symbol,
     flashloanProvider: candidate.flashloanLiquidity.provider,
     flashloanSource: candidate.flashloanLiquidity.sourceCode,
+    flashloanAmountRaw: candidate.amountIn,
+    leg1AmountInRaw: candidate.steps[0]?.amountIn,
+    flashloanAmountEqualsLeg1: candidate.steps[0]?.amountIn === candidate.amountIn,
+    routeShape: candidate.steps.length === 2 ? "A_B_A" : candidate.steps.length === 3 ? "A_B_C_A" : `A_${candidate.steps.length}_HOP_A`,
+    routeAlgebra: candidate.steps.length === 2 ? "A->B->A" : candidate.steps.length === 3 ? "A->B->C->A" : routePath(candidate),
+    c1Role: "ALWAYS_ON_HFT_CHAIN_WIDE_CAPTURE_ENGINE",
+    c2Role: "CHILD_REACTION_LANE_ONLY_AFTER_CONFIRMED_C1",
+    routeGuardKey: routeKeyFromC1Payload(
+      candidate.flashloanAsset.address,
+      candidate.steps.map((step) => ({
+        venue: step.edge.executorTarget,
+        tokenIn: step.edge.tokenIn,
+        tokenOut: step.edge.tokenOut,
+      })),
+    ),
     amountIn: candidate.amountIn,
     amountOut: candidate.amountOut,
+    repaymentRaw: candidate.repaymentRaw,
+    repaymentUsd: candidate.repaymentUsd,
+    requiredOutputRaw: candidate.requiredOutputRaw,
+    requiredOutputUsd: candidate.requiredOutputUsd,
+    executableSurplusRaw: candidate.executableSurplusRaw,
+    executableSurplusUsd: candidate.executableSurplusUsd,
+    economicMinTradeUsd: candidate.economicMinTradeUsd,
+    maxScannableTradeUsd: candidate.maxScannableTradeUsd,
+    profitabilityTargetEdgeBps: candidate.profitabilityTargetEdgeBps,
+    economicSizeOk: candidate.economicSizeOk,
     grossProfitUsd: candidate.grossProfitUsd,
     flashFeeUsd: candidate.flashFeeUsd,
     gasCostUsd: candidate.gasCostUsd,
+    riskBufferUsd: candidate.riskBufferUsd,
+    minProfitUsd: candidate.minProfitUsd,
+    requiredPremiumUsd: candidate.requiredPremiumUsd,
     netProfitUsd: candidate.netProfitUsd,
     profit_usd: candidate.netProfitUsd,
     lowestPoolTvlUsd: candidate.lowestPoolTvlUsd,
+    priceVariance: candidate.priceVariance,
+    reverseMathHint: candidate.priceVariance?.reverseMathHint,
+    leg1BuyPrice: candidate.priceVariance?.leg1BuyPrice,
+    leg2SellPrice: candidate.priceVariance?.leg2SellPrice,
+    priceEdgeBps: candidate.priceVariance?.priceEdgeBps,
     pools: candidate.steps.map((step) => step.edge.poolAddress),
     reason: candidate.rejectionReason,
     chain_id: 137,
     executionReady: Boolean(candidate.c1ExecutionEligible),
     c1ExecutableLimitPerCycle: intEnv("C1_EXECUTABLE_LIMIT_PER_CYCLE", DEFAULT_C1_EXECUTABLE_LIMIT),
+  };
+}
+
+export async function runDiscoveryCycle(options: {
+  targetContract?: string;
+  publish?: boolean;
+  source?: string;
+} = {}) {
+  const provider = new ethers.JsonRpcProvider(rpcUrl(), Number(CHAIN_ID), { staticNetwork: true });
+  const network = await provider.getNetwork();
+  if (network.chainId !== CHAIN_ID) throw new Error(`CHAIN_ID_MISMATCH:${network.chainId}`);
+  const targetContract = options.targetContract || (DEFAULT_C1_TARGET ? normalize(DEFAULT_C1_TARGET) : "");
+  if (!targetContract) throw new Error("C1_TARGET_MISSING");
+
+  const { latestBlock, tokenCache, flashloanAssets, flashloanBook, edges, stats } = await discoverGraph(provider);
+  const { candidates, gasCostUsd, minProfitUsd } = await rankCandidates(provider, tokenCache, flashloanBook.byAsset, flashloanAssets, edges, stats, targetContract);
+  const topRouteDisplayLimit = intEnv("TOP_ROUTE_DISPLAY_LIMIT", DEFAULT_TOP_ROUTE_DISPLAY_LIMIT);
+  const ledgerPayloads = candidates.slice(0, topRouteDisplayLimit).map(candidateToLedgerPayload);
+  if (options.publish !== false) {
+    await publishOpportunitySnapshot(ledgerPayloads, options.source || "live-cycle-module");
+  }
+  return {
+    latestBlock,
+    targetContract,
+    flashloanAssets,
+    flashloanLiquidity: flashloanBook.ordered,
+    edges,
+    stats,
+    candidates,
+    ledgerPayloads,
+    gasCostUsd,
+    minProfitUsd,
   };
 }
 
@@ -1503,16 +2673,21 @@ async function buildReverseRouteMetadata(
 
     const slippageBps = BigInt(Math.floor(numberEnv("SLIPPAGE_BPS", 10)));
     const deadline = Math.floor(Date.now() / 1000) + intEnv("EXECUTION_SUBMISSION_EXPIRY_SECONDS", 300);
-    const reverseSteps: RouteQuoteStep[] = [];
+    const reverseSteps: Array<Omit<RouteQuoteStep, "calldata">> = [];
     let amount = reverseFlashloanAmount;
     for (const reverse of [...candidate.steps].reverse().map((step) => reverseEdge(step.edge))) {
       const amountOut = await quoteEdge(provider, reverse, amount);
       if (amountOut <= 0n) throw new Error("REVERSE_QUOTE_ZERO_OUTPUT");
       const minAmountOut = bpsMin(amountOut, slippageBps);
-      const calldata = buildStepCalldata(reverse, amount, minAmountOut, targetContract, deadline);
-      reverseSteps.push({ edge: reverse, amountIn: amount, amountOut, minAmountOut, calldata });
+      reverseSteps.push({ edge: reverse, amountIn: amount, amountOut, minAmountOut });
       amount = amountOut;
     }
+    const reverseRouteSteps = buildRouteCalldataFromQuote({
+      steps: reverseSteps,
+      flashloanAsset: candidate.flashloanAsset.address,
+      receiver: targetContract,
+      deadline,
+    }) as RouteQuoteStep[];
 
     const flashFeeRaw = reverseFlashloanAmount * candidate.flashloanLiquidity.feeBps / 10000n;
     const reverseContext = {
@@ -1521,7 +2696,7 @@ async function buildReverseRouteMetadata(
       nonce: c1Nonce + 1n,
       merkleRoot: ethers.ZeroHash,
       proof: [],
-      steps: reverseSteps.map((step) => ({
+      steps: reverseRouteSteps.map((step) => ({
         venue: step.edge.executorTarget,
         tokenIn: step.edge.tokenIn,
         tokenOut: step.edge.tokenOut,
@@ -1532,8 +2707,8 @@ async function buildReverseRouteMetadata(
       })),
     };
 
-    const reversePathSymbols = reverseSteps.map((step) => step.edge.tokenInSymbol);
-    reversePathSymbols.push(reverseSteps[reverseSteps.length - 1]?.edge.tokenOutSymbol || candidate.flashloanAsset.symbol);
+    const reversePathSymbols = reverseRouteSteps.map((step) => step.edge.tokenInSymbol);
+    reversePathSymbols.push(reverseRouteSteps[reverseRouteSteps.length - 1]?.edge.tokenOutSymbol || candidate.flashloanAsset.symbol);
     return {
       available: true,
       reverseFlashloanSource: candidate.flashloanLiquidity.sourceCode,
@@ -1541,7 +2716,7 @@ async function buildReverseRouteMetadata(
       reverseFlashloanAmount: reverseFlashloanAmount.toString(),
       reverseContext,
       reversePath: reversePathSymbols.join("->"),
-      reverseVenues: reverseSteps.map((step) => `${step.edge.venueName}:${step.edge.invariant}`).join("->"),
+      reverseVenues: reverseRouteSteps.map((step) => `${step.edge.venueName}:${step.edge.invariant}`).join("->"),
       sizingRule: "REVERSE_FLASHLOAN_SIZE=min(15% x lowest route TVL, provider liquidity)",
     };
   } catch (error: any) {
@@ -1592,6 +2767,44 @@ function routeVenues(candidate: Candidate) {
   return candidate.steps.map((step) => `${step.edge.venueName}:${step.edge.invariant}`).join("->");
 }
 
+function rejectionBucket(reason: string) {
+  if (!reason || reason === "NONE") return "EXECUTABLE";
+  return reason.split(":")[0] || reason;
+}
+
+function candidateGateSummary(candidates: Candidate[], stats: DiscoveryStats) {
+  const reasonCounts = candidates.reduce((acc: Record<string, number>, candidate) => {
+    const key = candidate.status === "EXECUTABLE_PROFIT_CANDIDATE" ? "EXECUTABLE" : rejectionBucket(candidate.rejectionReason);
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const tokenCounts = candidates.reduce((acc: Record<string, number>, candidate) => {
+    acc[candidate.flashloanAsset.symbol] = (acc[candidate.flashloanAsset.symbol] || 0) + 1;
+    return acc;
+  }, {});
+  const venueCounts = candidates.reduce((acc: Record<string, number>, candidate) => {
+    for (const step of candidate.steps) {
+      acc[step.edge.venueName] = (acc[step.edge.venueName] || 0) + 1;
+    }
+    return acc;
+  }, {});
+  const topEntries = (values: Record<string, number>) => Object.entries(values)
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 12)
+    .map(([key, value]) => `${key}:${value}`)
+    .join(",");
+  return {
+    total: candidates.length,
+    executable: candidates.filter((candidate) => candidate.status === "EXECUTABLE_PROFIT_CANDIDATE").length,
+    c1Eligible: candidates.filter((candidate) => candidate.c1ExecutionEligible).length,
+    rejectedQuote: stats.routeCyclesRejectedQuote,
+    rejectedTvl: stats.routeCyclesRejectedTvl,
+    reasonCounts,
+    topTokens: topEntries(tokenCounts),
+    topVenues: topEntries(venueCounts),
+  };
+}
+
 async function main() {
   console.log("LIVE_CYCLE_PHASE|phase=BOOT_START");
   const provider = new ethers.JsonRpcProvider(rpcUrl(), Number(CHAIN_ID), { staticNetwork: true });
@@ -1610,13 +2823,17 @@ async function main() {
   const maxPrint = optionalIntEnv("LIVE_ROUTE_PRINT_LIMIT");
 
   console.log(`LIVE_CYCLE_START|chainId=${network.chainId}|block=${latestBlock}|api=${API_BASE}|serverHealth=${health.status || health.success}|serverReady=${readiness.status || readiness.ready}|broadcastPolicy=ONLY_AFTER_PROFIT_AND_FORK_PASS|routeMode=FULL_DYNAMIC_GRAPH|assetMode=BALANCER_FIRST_AAVE_FALLBACK_FLASHLOAN_LIQUIDITY|pnlUpdated=false`);
-  console.log(`DISCOVERY_SUMMARY|flashloanAssets=${stats.flashloanAssets}|flashloanBalancerAssets=${stats.flashloanBalancerAssets}|flashloanAaveAssets=${stats.flashloanAaveAssets}|tokens=${stats.tokens}|discoveredPools=${stats.discoveredPools}|directedEdges=${stats.discoveredEdges}|sourceCounts=${JSON.stringify(stats.sourceCounts)}|rejectedMetadata=${stats.rejectedMetadata}|rejectedZeroLiquidity=${stats.rejectedZeroLiquidity}|rejectedDuplicateEdge=${stats.rejectedDuplicateEdge}|rejectedUnsupportedInvariant=${stats.rejectedUnsupportedInvariant}|rejectedPreSend=${stats.rejectedPreSend}|rejectedLogScanChunks=${stats.rejectedLogScan}|routeCycles=${stats.routeCyclesEnumerated}|routeQuoteRejects=${stats.routeCyclesRejectedQuote}|truncated=${stats.truncated}|gasCostUsd=${gasCostUsd.toFixed(6)}|minProfitUsd=${minProfitUsd}|pnlUpdated=false`);
+  console.log(`DISCOVERY_SUMMARY|flashloanAssets=${stats.flashloanAssets}|flashloanBalancerAssets=${stats.flashloanBalancerAssets}|flashloanAaveAssets=${stats.flashloanAaveAssets}|forcedDiscoveryTokens=${stats.forcedDiscoveryTokens}|tokens=${stats.tokens}|discoveredPools=${stats.discoveredPools}|directedEdges=${stats.discoveredEdges}|sourceCounts=${JSON.stringify(stats.sourceCounts)}|rejectedMetadata=${stats.rejectedMetadata}|rejectedZeroLiquidity=${stats.rejectedZeroLiquidity}|rejectedDuplicateEdge=${stats.rejectedDuplicateEdge}|rejectedUnsupportedInvariant=${stats.rejectedUnsupportedInvariant}|rejectedLowTvlEdge=${stats.rejectedLowTvlEdge}|rejectedPreSend=${stats.rejectedPreSend}|preSendRejectReasons=${JSON.stringify(stats.preSendRejectReasons)}|rejectedLogScanChunks=${stats.rejectedLogScan}|routeCycles=${stats.routeCyclesEnumerated}|routeRepeatedTokenRejects=${stats.routeCyclesRejectedRepeatedToken}|routeVenueDiversityRejects=${stats.routeCyclesRejectedVenueDiversity}|routeConsecutiveVenueRejects=${stats.routeCyclesRejectedConsecutiveVenue}|routeTvlRejects=${stats.routeCyclesRejectedTvl}|routeQuoteRejects=${stats.routeCyclesRejectedQuote}|routeQuoteRejectReasons=${JSON.stringify(stats.routeQuoteRejectReasons)}|truncated=${stats.truncated}|gasCostUsd=${gasCostUsd.toFixed(6)}|minProfitUsd=${minProfitUsd}|minRoutePoolTvlUsd=${stats.minRoutePoolTvlUsd}|pnlUpdated=false`);
   console.log(`FLASHLOAN_LIQUIDITY|${flashloanBook.ordered.map((item) => `${item.provider}:${item.asset.symbol}:${item.asset.address}:liquidity=${ethers.formatUnits(item.liquidity, item.asset.decimals)}:feeBps=${item.feeBps}`).join(",")}`);
   console.log(`FLASHLOAN_ASSETS|${flashloanAssets.map((asset) => `${asset.symbol}:${asset.address}`).join(",")}`);
+  console.log(`DISCOVERY_FORCE_TOKENS|${Array.from(tokenCache.values()).filter((token) => DEFAULT_DISCOVERY_FORCE_TOKENS[token.symbol.toUpperCase()]?.toLowerCase() === token.address.toLowerCase()).map((token) => `${token.symbol}:${token.address}`).join(",")}`);
   console.log(`PRICE_MAP|${JSON.stringify(Object.fromEntries(Array.from(tokenCache.values()).filter((token) => token.priceUsd).map((token) => [token.symbol, Number(token.priceUsd?.toFixed(8))])))}`);
 
   const topRouteDisplayLimit = intEnv("TOP_ROUTE_DISPLAY_LIMIT", DEFAULT_TOP_ROUTE_DISPLAY_LIMIT);
   console.log(`ROUTE_LIMITS|totalRoutes=${candidates.length}|topRouteDisplayLimit=${topRouteDisplayLimit}|c1ExecutableLimitPerCycle=${intEnv("C1_EXECUTABLE_LIMIT_PER_CYCLE", DEFAULT_C1_EXECUTABLE_LIMIT)}|c2DecisionLimitPerCycle=${Number(process.env.C2_DECISION_LIMIT_PER_CYCLE || 50)}`);
+  console.log(`ROUTE_UNIVERSE_PROOF|doctrineOnly=${boolEnv("LIVE_ROUTE_ONLY_DOCTRINE_CYCLES", true)}|prioritizeDoctrine=${boolEnv("LIVE_ROUTE_PRIORITIZE_CROSS_VENUE_DOCTRINE", true)}|maxHops=${Math.max(2, Math.min(6, intEnv("MAX_ROUTE_HOPS", 4)))}|maxCycles=${intEnv("LIVE_ROUTE_MAX_CYCLES", DEFAULT_ROUTE_MAX_CYCLES)}|maxCyclesPerAsset=${optionalIntEnv("LIVE_ROUTE_MAX_CYCLES_PER_ASSET") ?? "AUTO"}|discoveredEdges=${stats.discoveredEdges}|routeCycles=${stats.routeCyclesEnumerated}|truncated=${stats.truncated}|sameVenueRejects=${stats.routeCyclesRejectedConsecutiveVenue}|venueDiversityRejects=${stats.routeCyclesRejectedVenueDiversity}|repeatedTokenRejects=${stats.routeCyclesRejectedRepeatedToken}|repeatedPoolRejects=${stats.routeCyclesRejectedRepeatedPool}|pnlUpdated=false`);
+  const gateSummary = candidateGateSummary(candidates, stats);
+  console.log(`ROUTE_GATE_SUMMARY|total=${gateSummary.total}|executable=${gateSummary.executable}|c1Eligible=${gateSummary.c1Eligible}|rejectedQuote=${gateSummary.rejectedQuote}|rejectedTvl=${gateSummary.rejectedTvl}|reasons=${JSON.stringify(gateSummary.reasonCounts)}|topTokens=${gateSummary.topTokens}|topVenues=${gateSummary.topVenues}|pnlUpdated=false`);
 
   for (const candidate of maxPrint === undefined ? candidates.slice(0, topRouteDisplayLimit) : candidates.slice(0, Math.min(maxPrint, topRouteDisplayLimit))) {
     console.log([
@@ -1632,11 +2849,25 @@ async function main() {
       `path=${routePath(candidate)}`,
       `venues=${routeVenues(candidate)}`,
       `hops=${candidate.steps.length}`,
+      `routeShape=${candidate.steps.length === 2 ? "A_B_A" : candidate.steps.length === 3 ? "A_B_C_A" : `A_${candidate.steps.length}_HOP_A`}`,
+      `flashloanAmountEqualsLeg1=${candidate.steps[0]?.amountIn === candidate.amountIn}`,
       `amountIn=${ethers.formatUnits(candidate.amountIn, candidate.flashloanAsset.decimals)}`,
       `amountOut=${ethers.formatUnits(candidate.amountOut, candidate.flashloanAsset.decimals)}`,
+      `repayment=${ethers.formatUnits(candidate.repaymentRaw, candidate.flashloanAsset.decimals)}`,
+      `requiredOut=${candidate.requiredOutputRaw === undefined ? "UNPRICED" : ethers.formatUnits(candidate.requiredOutputRaw, candidate.flashloanAsset.decimals)}`,
+      `requiredOutputUsd=${candidate.requiredOutputUsd?.toFixed(6) ?? "UNPRICED"}`,
+      `executableSurplus=${candidate.executableSurplusRaw === undefined ? "UNPRICED" : ethers.formatUnits(candidate.executableSurplusRaw, candidate.flashloanAsset.decimals)}`,
+      `executableSurplusUsd=${candidate.executableSurplusUsd?.toFixed(6) ?? "UNPRICED"}`,
+      `economicMinTradeUsd=${candidate.economicMinTradeUsd?.toFixed(6) ?? "UNPRICED"}`,
+      `maxScannableTradeUsd=${candidate.maxScannableTradeUsd?.toFixed(6) ?? "UNPRICED"}`,
+      `profitabilityTargetEdgeBps=${candidate.profitabilityTargetEdgeBps?.toFixed(2) ?? "UNPRICED"}`,
+      `economicSizeOk=${candidate.economicSizeOk ?? "UNPRICED"}`,
       `grossProfitUsd=${candidate.grossProfitUsd?.toFixed(6) ?? "UNPRICED"}`,
       `flashFeeUsd=${candidate.flashFeeUsd?.toFixed(6) ?? "UNPRICED"}`,
       `gasCostUsd=${candidate.gasCostUsd?.toFixed(6) ?? "UNPRICED"}`,
+      `riskBufferUsd=${candidate.riskBufferUsd?.toFixed(6) ?? "UNPRICED"}`,
+      `minProfitUsd=${candidate.minProfitUsd?.toFixed(6) ?? "UNPRICED"}`,
+      `requiredPremiumUsd=${candidate.requiredPremiumUsd?.toFixed(6) ?? "UNPRICED"}`,
       `netProfitUsd=${candidate.netProfitUsd?.toFixed(6) ?? "UNPRICED"}`,
       `lowestPoolTvlUsd=${candidate.lowestPoolTvlUsd.toFixed(2)}`,
       `pools=${candidate.steps.map((step) => `${step.edge.venueName}:${step.edge.poolAddress}`).join(",")}`,
@@ -1678,12 +2909,15 @@ async function main() {
   console.log("C2_DECISION|decision=DO_NOTHING|reason=NO_CONFIRMED_C1_HASH_IN_THIS_CYCLE|hash=NONE|pnlUpdated=false");
   const pnl = await getJson("/api/dashboard/pnl-summary").catch((error) => ({ error: error.message }));
   console.log(`PNL_STATUS|sessionRaw=${pnl.sessionPnlRaw ?? "UNKNOWN"}|lifetimeRaw=${pnl.lifetimePnlRaw ?? "UNKNOWN"}|attribution=${pnl.pnlAttribution ?? "UNKNOWN"}|pnlUpdated=false`);
+  await flushLaneEventBatch("cycle_end");
   console.log("LIVE_CYCLE_END|status=COMPLETE|broadcasted=false_unless_hash_printed_above");
 }
 
-main().then(() => {
-  process.exit(0);
-}).catch((error) => {
-  console.error(`LIVE_CYCLE_FAILED|error=${error?.message || error}|broadcasted=false|pnlUpdated=false`);
-  process.exit(1);
-});
+if (process.argv[1]?.replace(/\\/g, "/").endsWith("scripts/live-cycle.ts")) {
+  main().then(() => {
+    process.exit(0);
+  }).catch((error) => {
+    console.error(`LIVE_CYCLE_FAILED|error=${error?.message || error}|broadcasted=false|pnlUpdated=false`);
+    process.exit(1);
+  });
+}

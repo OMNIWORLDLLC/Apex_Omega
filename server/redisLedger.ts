@@ -1,23 +1,66 @@
 import { createClient, type RedisClientType } from "redis";
 import { createHash } from "node:crypto";
+import { deflateSync } from "node:zlib";
+import { pack } from "msgpackr";
 
 const DEFAULT_REDIS_URL = "redis://127.0.0.1:6379";
 const KEY_PREFIX = process.env.REDIS_KEY_PREFIX || "apex:omega";
 const SNAPSHOT_TTL_MS = Number(process.env.REDIS_OPPORTUNITY_TTL_MS || 120_000);
 const EXECUTION_LOCK_TTL_MS = Number(process.env.REDIS_EXECUTION_LOCK_TTL_MS || 45_000);
 const CONNECT_TIMEOUT_MS = Number(process.env.REDIS_CONNECT_TIMEOUT_MS || 600);
+const STREAM_MAX_LEN = Number(process.env.REDIS_STREAM_MAX_LEN || 20_000);
+const LANE_BATCH_WINDOW_MS = Number(process.env.REDIS_LANE_BATCH_WINDOW_MS || 50);
+const LANE_BATCH_MAX_SIZE = Number(process.env.REDIS_LANE_BATCH_MAX_SIZE || 1_000);
+const OPPORTUNITY_THRESHOLD_BPS = Number(process.env.REDIS_OPPORTUNITY_THRESHOLD_BPS || 1);
+const ENABLE_KEYSPACE_NOTIFICATIONS = process.env.REDIS_ENABLE_KEYSPACE_NOTIFICATIONS === "true";
+const REDIS_REQUIRED_FOR_LIVE = process.env.REDIS_REQUIRED_FOR_LIVE !== "false";
 
 type LedgerPayload = Record<string, any>;
 
+export interface RouteGuardStep {
+  venue: string;
+  tokenIn: string;
+  tokenOut: string;
+}
+
+export interface ArbitrageRouteSummary {
+  tokenIn: string;
+  tokenOut: string;
+  legs: RouteGuardStep[];
+}
+
 let clientPromise: Promise<RedisClientType | null> | null = null;
 let lastError: string | null = null;
+let laneBuffer: LedgerPayload[] = [];
+let laneFlushTimer: NodeJS.Timeout | null = null;
+let runtimeLiveExecutionArmed: boolean | null = null;
 
 function redisEnabled() {
   return process.env.REDIS_ENABLED !== "false";
 }
 
+function isLiveExecutionArmed() {
+  if (runtimeLiveExecutionArmed !== null) return runtimeLiveExecutionArmed;
+  return process.env.LIVE_EXECUTION === "true" &&
+    process.env.SHADOW_MODE === "false" &&
+    process.env.EXECUTION_DISABLED !== "true" &&
+    process.env.DISCOVERY_ONLY_MODE !== "true";
+}
+
+export function setRedisLiveExecutionArmed(armed: boolean) {
+  runtimeLiveExecutionArmed = armed;
+}
+
+function redisRequiredForThisRuntime() {
+  return REDIS_REQUIRED_FOR_LIVE && isLiveExecutionArmed();
+}
+
 function redisUrl() {
   return process.env.REDIS_URL || process.env.APEX_REDIS_URL || DEFAULT_REDIS_URL;
+}
+
+function redisSocketPath() {
+  return process.env.REDIS_SOCKET_PATH || process.env.APEX_REDIS_SOCKET_PATH || "";
 }
 
 function timeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -51,12 +94,59 @@ function json(value: any) {
   return JSON.stringify(normalizeForJson(value));
 }
 
+function redisStreamFields(value: LedgerPayload) {
+  return Object.fromEntries(
+    Object.entries(normalizeForJson(value)).map(([key, nested]) => [
+      key,
+      nested === undefined || nested === null
+        ? ""
+        : typeof nested === "string"
+          ? nested
+          : JSON.stringify(nested),
+    ]),
+  );
+}
+
 function parseRedisJson(raw: unknown) {
   return typeof raw === "string" && raw ? JSON.parse(raw) : null;
 }
 
 function hashPayload(value: any) {
   return createHash("sha256").update(json(value)).digest("hex");
+}
+
+export function routeKeyFromC1Payload(flashloanAsset: string, steps: RouteGuardStep[]): string {
+  const asset = String(flashloanAsset || "").toLowerCase();
+  const stepParts = steps.map((step) =>
+    `${String(step.venue ?? "").toLowerCase()}:${String(step.tokenIn ?? "").toLowerCase()}:${String(step.tokenOut ?? "").toLowerCase()}`
+  );
+  return `arb:lock:${asset}:${stepParts.join(":")}`;
+}
+
+export function routeKeyFromArbitrageRoute(route: ArbitrageRouteSummary): string {
+  const parts = route.legs.map((leg) =>
+    `${String(leg.venue ?? "").toLowerCase()}:${String(leg.tokenIn ?? "").toLowerCase()}:${String(leg.tokenOut ?? "").toLowerCase()}`
+  );
+  return `arb:lock:${String(route.tokenIn || "").toLowerCase()}:${String(route.tokenOut || "").toLowerCase()}:${parts.join(":")}`;
+}
+
+export function routeKeyFromC1InternalId(c1InternalId: string): string {
+  return `arb:c2:lock:${String(c1InternalId || "").toLowerCase()}`;
+}
+
+export function routeKeyFromLiquidation(
+  targetContract: string,
+  user: string,
+  debtAsset: string,
+  collateralAsset: string,
+): string {
+  return [
+    "arb:liq:lock",
+    String(targetContract || "").toLowerCase(),
+    String(user || "").toLowerCase(),
+    String(debtAsset || "").toLowerCase(),
+    String(collateralAsset || "").toLowerCase(),
+  ].join(":");
 }
 
 function opportunityKey(id: string) {
@@ -75,7 +165,20 @@ function laneSetKey() {
   return `${KEY_PREFIX}:lanes:events`;
 }
 
+function laneBatchStreamKey() {
+  return `${KEY_PREFIX}:lanes:batches`;
+}
+
+function opportunityThresholdStreamKey() {
+  return `${KEY_PREFIX}:opportunities:thresholds`;
+}
+
+function opportunityThresholdKey(id: string) {
+  return `${KEY_PREFIX}:opportunity-threshold:${id}`;
+}
+
 export function opportunityId(payload: LedgerPayload) {
+  if (payload.routeGuardKey) return hashPayload(String(payload.routeGuardKey));
   const routeFingerprint = [
     payload.routeId,
     payload.payloadKind,
@@ -96,8 +199,11 @@ export async function getRedisClient(): Promise<RedisClientType | null> {
   clientPromise = (async () => {
     try {
       const client = createClient({
-        url: redisUrl(),
+        ...(redisSocketPath()
+          ? {}
+          : { url: redisUrl() }),
         socket: {
+          ...(redisSocketPath() ? { path: redisSocketPath() } : {}),
           connectTimeout: CONNECT_TIMEOUT_MS,
           reconnectStrategy: false,
         },
@@ -106,6 +212,11 @@ export async function getRedisClient(): Promise<RedisClientType | null> {
         lastError = error.message;
       });
       await timeout(client.connect(), CONNECT_TIMEOUT_MS + 250, "REDIS_CONNECT");
+      if (ENABLE_KEYSPACE_NOTIFICATIONS) {
+        await client.configSet("notify-keyspace-events", "Kh").catch((error: any) => {
+          lastError = `KEYSPACE_NOTIFY_UNAVAILABLE:${error?.message || error}`;
+        });
+      }
       lastError = null;
       return client as RedisClientType;
     } catch (error: any) {
@@ -121,11 +232,62 @@ export async function getRedisClient(): Promise<RedisClientType | null> {
 export function getRedisLedgerStatus() {
   return {
     enabled: redisEnabled(),
+    requiredForLive: REDIS_REQUIRED_FOR_LIVE,
+    requiredNow: redisRequiredForThisRuntime(),
     connected: Boolean(clientPromise) && !lastError,
-    url: redisUrl().replace(/\/\/.*@/, "//***@"),
+    url: redisSocketPath() ? `unix://${redisSocketPath()}` : redisUrl().replace(/\/\/.*@/, "//***@"),
+    transport: redisSocketPath() ? "unix_socket" : "tcp",
+    architecture: process.env.REDIS_ARCHITECTURE || "hot_path_execution_ledger",
     keyPrefix: KEY_PREFIX,
+    streams: {
+      laneEvents: laneSetKey(),
+      laneBatches: laneBatchStreamKey(),
+      opportunityThresholds: opportunityThresholdStreamKey(),
+      batchWindowMs: LANE_BATCH_WINDOW_MS,
+      batchMaxSize: LANE_BATCH_MAX_SIZE,
+      thresholdBps: OPPORTUNITY_THRESHOLD_BPS,
+      codec: "msgpack+deflate",
+      streamMaxLen: STREAM_MAX_LEN,
+    },
     lastError,
   };
+}
+
+function thresholdMoved(previous: any, next: any) {
+  if (!previous) return true;
+  const previousProfit = Number(previous.netProfitUsd ?? previous.profit_usd ?? 0);
+  const nextProfit = Number(next.netProfitUsd ?? next.profit_usd ?? 0);
+  const previousAmountOut = Number(previous.amountOut ?? 0);
+  const nextAmountOut = Number(next.amountOut ?? 0);
+  const previousRank = Number(previous.rank ?? 0);
+  const nextRank = Number(next.rank ?? 0);
+  if (previousRank && nextRank && previousRank !== nextRank) return true;
+  const movedBps = (oldValue: number, newValue: number) => {
+    if (!Number.isFinite(oldValue) || !Number.isFinite(newValue)) return 0;
+    const basis = Math.max(Math.abs(oldValue), 1);
+    return Math.abs(newValue - oldValue) * 10_000 / basis;
+  };
+  return movedBps(previousProfit, nextProfit) >= OPPORTUNITY_THRESHOLD_BPS ||
+    movedBps(previousAmountOut, nextAmountOut) >= OPPORTUNITY_THRESHOLD_BPS;
+}
+
+async function emitOpportunityThreshold(client: RedisClientType, id: string, previous: any, next: any, source: string) {
+  const event = normalizeForJson({
+    redisId: id,
+    routeId: next.routeId,
+    source,
+    path: next.path,
+    venues: next.venues,
+    rank: next.rank,
+    status: next.status,
+    netProfitUsd: next.netProfitUsd ?? next.profit_usd,
+    previousNetProfitUsd: previous?.netProfitUsd ?? previous?.profit_usd,
+    previousRank: previous?.rank,
+    at: Date.now(),
+  });
+  await client.hSet(opportunityThresholdKey(id), { payload: json(event), updatedAt: String(Date.now()) });
+  await client.xAdd(opportunityThresholdStreamKey(), "*", redisStreamFields(event));
+  await client.xTrim(opportunityThresholdStreamKey(), "MAXLEN", STREAM_MAX_LEN);
 }
 
 export async function publishOpportunitySnapshot(
@@ -163,6 +325,9 @@ export async function publishOpportunitySnapshot(
     await client.hSet(opportunityKey(id), { payload: json(record), updatedAt: String(now) });
     await client.pExpire(opportunityKey(id), ttlMs * 3);
     await client.zAdd(activeSetKey(), [{ score: now, value: id }]);
+    if (!preserve && thresholdMoved(existing, record)) {
+      await emitOpportunityThreshold(client, id, existing, record, source).catch(() => undefined);
+    }
     visible.push(record);
   }
 
@@ -183,11 +348,16 @@ export async function getActiveLedgerOpportunities(limit = 100) {
     if (parsed) rows.push(parsed);
   }
   return rows.sort((left, right) => {
+    const leftExecutable = left.status === "EXECUTABLE_PROFIT_CANDIDATE" || left.c1ExecutionEligible || left.executionReady;
+    const rightExecutable = right.status === "EXECUTABLE_PROFIT_CANDIDATE" || right.c1ExecutionEligible || right.executionReady;
+    if (leftExecutable !== rightExecutable) return rightExecutable ? 1 : -1;
+    const profitDelta = Number(right.profit_usd ?? right.netProfitUsd ?? Number.NEGATIVE_INFINITY) -
+      Number(left.profit_usd ?? left.netProfitUsd ?? Number.NEGATIVE_INFINITY);
+    if (profitDelta !== 0) return profitDelta;
     const leftRank = Number(left.rank ?? Number.MAX_SAFE_INTEGER);
     const rightRank = Number(right.rank ?? Number.MAX_SAFE_INTEGER);
     if (leftRank !== rightRank) return leftRank - rightRank;
-    return Number(right.profit_usd ?? right.netProfitUsd ?? Number.NEGATIVE_INFINITY) -
-      Number(left.profit_usd ?? left.netProfitUsd ?? Number.NEGATIVE_INFINITY);
+    return 0;
   });
 }
 
@@ -197,10 +367,22 @@ export async function getActiveLedgerCount() {
   return await client.zCard(activeSetKey());
 }
 
+export async function getLedgerOpportunityById(id: string) {
+  const client = await getRedisClient();
+  if (!client) return null;
+  const raw = await client.hGet(opportunityKey(id), "payload");
+  return parseRedisJson(raw);
+}
+
 export async function lockOpportunityForExecution(payload: LedgerPayload, ttlMs = EXECUTION_LOCK_TTL_MS) {
   const client = await getRedisClient();
   const id = opportunityId(payload);
-  if (!client) return { ok: true, redis: false, id, reason: "REDIS_UNAVAILABLE_MEMORY_LOCK_ONLY" };
+  if (!client) {
+    if (redisRequiredForThisRuntime()) {
+      return { ok: false, redis: false, id, reason: "REDIS_REQUIRED_FOR_LIVE_UNAVAILABLE" };
+    }
+    return { ok: true, redis: false, id, reason: "REDIS_UNAVAILABLE_MEMORY_LOCK_ONLY" };
+  }
   const lockValue = `${process.pid}:${Date.now()}`;
   const result = await client.set(lockKey(id), lockValue, { NX: true, PX: ttlMs });
   if (result !== "OK") return { ok: false, redis: true, id, reason: "ALREADY_LOCKED_OR_IN_FLIGHT" };
@@ -232,15 +414,47 @@ export async function releaseOpportunityLock(id: string, status: string, patch: 
 }
 
 export async function recordLaneEvent(event: LedgerPayload) {
+  const normalized = normalizeForJson(event);
+  laneBuffer.push(normalized);
+  if (laneBuffer.length >= LANE_BATCH_MAX_SIZE) {
+    await flushLaneEventBatch("max_size");
+    return;
+  }
+  if (!laneFlushTimer) {
+    laneFlushTimer = setTimeout(() => {
+      void flushLaneEventBatch("timer");
+    }, LANE_BATCH_WINDOW_MS);
+    laneFlushTimer.unref?.();
+  }
+}
+
+export async function flushLaneEventBatch(reason = "manual") {
+  if (laneFlushTimer) {
+    clearTimeout(laneFlushTimer);
+    laneFlushTimer = null;
+  }
+  const batch = laneBuffer;
+  laneBuffer = [];
+  if (batch.length === 0) return;
   const client = await getRedisClient();
   if (!client) return;
-  const normalized = normalizeForJson(event);
-  const fields = Object.fromEntries(
-    Object.entries(normalized).map(([key, value]) => [
-      key,
-      typeof value === "string" ? value : JSON.stringify(value),
-    ]),
-  );
-  await client.xAdd(laneSetKey(), "*", fields);
-  await client.xTrim(laneSetKey(), "MAXLEN", 2_000);
+  const encoded = deflateSync(pack(batch));
+  await client.xAdd(laneBatchStreamKey(), "*", {
+    codec: "msgpack+deflate",
+    reason,
+    count: String(batch.length),
+    pid: String(process.pid),
+    at: String(Date.now()),
+    payload: encoded,
+  });
+  await client.xTrim(laneBatchStreamKey(), "MAXLEN", STREAM_MAX_LEN);
+}
+
+export async function ensureRedisConsumerGroup(stream: string, group: string, startId = "0") {
+  const client = await getRedisClient();
+  if (!client) return false;
+  await client.xGroupCreate(stream, group, startId, { MKSTREAM: true }).catch((error: any) => {
+    if (!String(error?.message || error).includes("BUSYGROUP")) throw error;
+  });
+  return true;
 }

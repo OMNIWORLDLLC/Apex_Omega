@@ -70,6 +70,8 @@ services:
       FORK_SIM_RPC_URL: http://anvil-fork:8545
       REDIS_URL: redis://redis:6379
       REDIS_ENABLED: ${REDIS_ENABLED:-true}
+      REDIS_REQUIRED_FOR_LIVE: ${REDIS_REQUIRED_FOR_LIVE:-true}
+      REDIS_ARCHITECTURE: hot_path_execution_ledger
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval: 30s

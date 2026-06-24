@@ -36,11 +36,29 @@ export interface LiquidationParams {
 export type VmBroadcastResult = {
   success: boolean;
   hash?: string;
+  hashLink?: string;
   expectedProfit?: string;
   error?: string;
   payloadKind?: string;
-  hashLink?: string;
   forkSimulation?: { ok: boolean; error?: string };
+  calldataHash?: string;
+  signedTxHash?: string;
+  parsedTxHash?: string;
+  hashMatches?: boolean;
+  from?: string;
+  to?: string;
+  nonce?: number;
+  gasLimit?: string;
+  gasPrice?: string;
+  maxFeePerGas?: string;
+  maxPriorityFeePerGas?: string;
+  broadcastMode?: string;
+  bundleEnvelope?: {
+    kind: string;
+    privateRelayConfigured: boolean;
+    relayUrlMasked?: string;
+    submittedAt: string;
+  };
 };
 
 const APEX_VM_ABI = [
@@ -125,6 +143,80 @@ export class DeFiExecutorManager {
     }
     return null;
   }
+
+  private maskedRelayUrl(url: string) {
+    try {
+      const parsed = new URL(url);
+      return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+    } catch {
+      return "configured";
+    }
+  }
+
+  private async submitTransparentTransaction(payloadKind: string, to: string, data: string): Promise<VmBroadcastResult> {
+    if (!this.signer) {
+      return { success: false, error: `SIGNER_UNAVAILABLE: no private key loaded for ${payloadKind}.`, payloadKind };
+    }
+    const populated = await this.signer.populateTransaction({ to, data, value: 0n });
+    const signedRaw = await this.signer.signTransaction(populated);
+    const parsed = ethers.Transaction.from(signedRaw);
+    const signedTxHash = parsed.hash || ethers.keccak256(signedRaw);
+    const relayUrl = process.env.MEV_PRIVATE_RELAY_URL || process.env.BLOXROUTE_RELAY_URL || process.env.TITAN_RELAY_URL || "";
+    const privateFirst = String(process.env.EXECUTION_MODE || "").toUpperCase().includes("PRIVATE") && relayUrl.startsWith("http");
+    const bundleEnvelope = {
+      kind: privateFirst ? "PRIVATE_RELAY_RAW_TX_BUNDLE" : "PUBLIC_RPC_RAW_TX_BROADCAST",
+      privateRelayConfigured: Boolean(relayUrl),
+      relayUrlMasked: relayUrl ? this.maskedRelayUrl(relayUrl) : undefined,
+      submittedAt: new Date().toISOString(),
+    };
+
+    let hash = signedTxHash;
+    let broadcastMode = "PUBLIC_RPC_RAW_TRANSACTION";
+    if (privateFirst) {
+      const method = process.env.MEV_PRIVATE_RELAY_METHOD || "eth_sendRawTransaction";
+      const response = await fetch(relayUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(process.env.MEV_PRIVATE_RELAY_AUTH ? { authorization: process.env.MEV_PRIVATE_RELAY_AUTH } : {}),
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params: [signedRaw] }),
+      });
+      const json: any = await response.json().catch(() => ({}));
+      if (!response.ok || json.error) {
+        throw new Error(`PRIVATE_RELAY_REJECTED:${json.error?.message || response.statusText || response.status}`);
+      }
+      if (typeof json.result === "string" && ethers.isHexString(json.result, 32)) {
+        hash = json.result;
+      }
+      broadcastMode = `PRIVATE_RELAY:${method}`;
+    } else {
+      const tx = await this.provider.broadcastTransaction(signedRaw);
+      hash = tx.hash;
+    }
+
+    return {
+      success: true,
+      hash,
+      hashLink: `https://polygonscan.com/tx/${hash}`,
+      payloadKind,
+      forkSimulation: { ok: true },
+      calldataHash: ethers.keccak256(data),
+      signedTxHash,
+      parsedTxHash: parsed.hash || signedTxHash,
+      hashMatches: hash.toLowerCase() === signedTxHash.toLowerCase(),
+      from: this.signer.address,
+      to,
+      nonce: typeof populated.nonce === "number" ? populated.nonce : undefined,
+      gasLimit: populated.gasLimit?.toString(),
+      gasPrice: populated.gasPrice?.toString(),
+      maxFeePerGas: populated.maxFeePerGas?.toString(),
+      maxPriorityFeePerGas: populated.maxPriorityFeePerGas?.toString(),
+      broadcastMode,
+      bundleEnvelope,
+    };
+  }
+
   private requireAddress(value: string, label: string) {
     if (!ethers.isAddress(value)) {
       throw new Error(`INVALID_${label.toUpperCase()}: ${value}`);
@@ -218,8 +310,7 @@ export class DeFiExecutorManager {
       const data = this.buildVmCallData("C1", [flashloanSource, flashloanAsset, BigInt(flashloanAmount), normalized]);
       const forkBlocked = await this.requireForkSimulation("FLASHLOAN_INTEGRATED_C1_PAYLOADS", targetContract, data);
       if (forkBlocked) return forkBlocked;
-      const tx = await this.signer!.sendTransaction({ to: targetContract, data, value: 0n });
-      return { success: true, hash: tx.hash, hashLink: `https://polygonscan.com/tx/${tx.hash}`, payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS", forkSimulation: { ok: true } };
+      return await this.submitTransparentTransaction("FLASHLOAN_INTEGRATED_C1_PAYLOADS", targetContract, data);
     } catch (error: any) {
       return { success: false, error: error?.message || "C1 execution failed", payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS" };
     }
@@ -244,8 +335,7 @@ export class DeFiExecutorManager {
       const data = this.buildVmCallData("C2", [c1InternalId, flashloanSource, flashloanAsset, BigInt(flashloanAmount), normalized]);
       const forkBlocked = await this.requireForkSimulation("FLASHLOAN_INTEGRATED_C2_PAYLOADS", targetContract, data);
       if (forkBlocked) return forkBlocked;
-      const tx = await this.signer!.sendTransaction({ to: targetContract, data, value: 0n });
-      return { success: true, hash: tx.hash, hashLink: `https://polygonscan.com/tx/${tx.hash}`, payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS", forkSimulation: { ok: true } };
+      return await this.submitTransparentTransaction("FLASHLOAN_INTEGRATED_C2_PAYLOADS", targetContract, data);
     } catch (error: any) {
       return { success: false, error: error?.message || "C2 execution failed", payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS" };
     }
@@ -263,8 +353,7 @@ export class DeFiExecutorManager {
       const data = this.buildLiquidationCallData(params.liquidation);
       const forkBlocked = await this.requireForkSimulation("FLASHLOAN_INTEGRATED_LIQUIDATIONS", params.targetContract, data);
       if (forkBlocked) return forkBlocked;
-      const tx = await this.signer!.sendTransaction({ to: params.targetContract, data, value: 0n });
-      return { success: true, hash: tx.hash, hashLink: `https://polygonscan.com/tx/${tx.hash}`, payloadKind: "FLASHLOAN_INTEGRATED_LIQUIDATIONS", forkSimulation: { ok: true } };
+      return await this.submitTransparentTransaction("FLASHLOAN_INTEGRATED_LIQUIDATIONS", params.targetContract, data);
     } catch (error: any) {
       return { success: false, error: error?.message || "Liquidation execution failed", payloadKind: "FLASHLOAN_INTEGRATED_LIQUIDATIONS" };
     }

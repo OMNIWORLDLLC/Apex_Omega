@@ -7,13 +7,16 @@ import { ethers } from "ethers";
 import { WebSocketServer } from "ws";
 import { DeFiExecutorManager } from "./ExecutionManager.js";
 import { InvariantMath } from "./server/engine/invariants.js";
+import { runDiscoveryCycle } from "./scripts/live-cycle.js";
 import {
   getActiveLedgerCount,
   getActiveLedgerOpportunities,
+  getLedgerOpportunityById,
   getRedisLedgerStatus,
   lockOpportunityForExecution,
   publishOpportunitySnapshot,
   releaseOpportunityLock,
+  setRedisLiveExecutionArmed,
 } from "./server/redisLedger.js";
 
 const CONFIG_PATH = path.join(process.cwd(), "config.json");
@@ -47,6 +50,7 @@ function getEnvRuntimeDefaults(): Record<string, any> {
   return compactConfigDefaults({
     LIVE_EXECUTION: process.env.LIVE_EXECUTION === undefined ? undefined : process.env.LIVE_EXECUTION === "true",
     SHADOW_MODE: process.env.SHADOW_MODE === undefined ? undefined : process.env.SHADOW_MODE === "true",
+    APEX_PIPELINE_MODE: process.env.APEX_PIPELINE_MODE,
     REQUIRE_FORK_SIM_BEFORE_SUBMIT: process.env.REQUIRE_FORK_SIM_BEFORE_SUBMIT === undefined ? true : process.env.REQUIRE_FORK_SIM_BEFORE_SUBMIT === "true",
     REQUIRE_CHAIN_ID_MATCH: process.env.REQUIRE_CHAIN_ID_MATCH === undefined ? true : process.env.REQUIRE_CHAIN_ID_MATCH === "true",
     EXECUTION_MODE: process.env.EXECUTION_MODE || "PRIVATE_FIRST",
@@ -64,6 +68,152 @@ function getRuntimeConfig(): any {
     console.warn("[getRuntimeConfig] Failed to read config.json.");
   }
   return getEnvRuntimeDefaults();
+}
+
+function isTruthyFlag(value: any): boolean {
+  return value === true || String(value).toLowerCase() === "true" || String(value) === "1";
+}
+
+function runtimeBoolean(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  return raw === undefined || raw === "" ? fallback : isTruthyFlag(raw);
+}
+
+function runtimeNumber(name: string, fallback: number, minimum: number = 0): number {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed >= minimum ? parsed : fallback;
+}
+
+type ApexPipelineMode = "developer" | "simulation" | "live";
+
+function normalizeApexPipelineMode(value: any): ApexPipelineMode | null {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "developer" || normalized === "dev" || normalized === "discovery") return "developer";
+  if (normalized === "simulation" || normalized === "sim" || normalized === "shadow") return "simulation";
+  if (normalized === "live" || normalized === "production") return "live";
+  return null;
+}
+
+function getApexPipelineMode(config: Record<string, any> = getRuntimeConfig()): ApexPipelineMode {
+  const explicit = normalizeApexPipelineMode(config.APEX_PIPELINE_MODE || process.env.APEX_PIPELINE_MODE);
+  if (explicit) return explicit;
+  if (isExecutionDisabled(config)) return "developer";
+  if (isTruthyFlag(config.LIVE_EXECUTION) && !isTruthyFlag(config.SHADOW_MODE)) return "live";
+  return "simulation";
+}
+
+function apexPipelineCapabilities(config: Record<string, any> = getRuntimeConfig()) {
+  const mode = getApexPipelineMode(config);
+  return {
+    mode,
+    c1Role: "ALWAYS_ON_HFT_CHAIN_WIDE_CAPTURE_ENGINE",
+    c2Role: "CHILD_REACTION_LANE_ONLY_AFTER_CONFIRMED_C1",
+    discovery: true,
+    executableRouting: true,
+    payloadEnvelopeLogging: mode !== "developer",
+    forkSimulationGate: mode !== "developer",
+    liveSigning: mode === "live",
+    liveBroadcast: mode === "live",
+    polygonscanHashRequired: mode === "live",
+    executionDisabled: isExecutionDisabled(config),
+  };
+}
+
+function getHttpPort(): number {
+  return runtimeNumber("PORT", runtimeNumber("WEB_PORT", 3000, 1), 1);
+}
+
+function getHttpHost(): string {
+  const raw = String(process.env.HOST || "").trim();
+  return raw || "0.0.0.0";
+}
+
+function getOracleStreamPath(): string {
+  const raw = String(process.env.ORACLE_WS_PATH || "/api/oracle-stream").trim();
+  return raw.startsWith("/") ? raw : `/${raw}`;
+}
+
+function getOraclePushIntervalMs(): number {
+  return runtimeNumber("WS_PUSH_INTERVAL_SEC", 4, 1) * 1000;
+}
+
+function shouldWaitForReceipt(body?: any): boolean {
+  if (typeof body?.waitForReceipt === "boolean") return body.waitForReceipt;
+  return runtimeBoolean("WAIT_FOR_RECEIPT", false);
+}
+
+function getReceiptWaitTimeoutMs(body?: any): number {
+  const parsed = Number(body?.receiptWaitTimeoutMs ?? process.env.WAIT_FOR_RECEIPT_TIMEOUT_MS ?? 90000);
+  return Number.isFinite(parsed) && parsed >= 1000 ? parsed : 90000;
+}
+
+function getReceiptWaitPriority(): "WSS_FIRST" | "HTTP_FIRST" {
+  return String(process.env.WSS_PRIORITY || "").trim().toUpperCase() === "HTTP_FIRST"
+    ? "HTTP_FIRST"
+    : "WSS_FIRST";
+}
+
+function getReceiptWaitBackoffConfig() {
+  const initialMs = runtimeNumber("WSS_RECONNECT_BACKOFF_MS", 500, 100);
+  const maxMs = runtimeNumber("WSS_MAX_RECONNECT_BACKOFF_MS", 10000, initialMs);
+  return {
+    initialMs,
+    maxMs: Math.max(initialMs, maxMs),
+    reconnectEnabled: runtimeBoolean("WSS_RECONNECT_ENABLED", true),
+  };
+}
+
+function getWssProviderUrl(): string {
+  const raw = String(process.env.WSS_PROVIDER || "").trim();
+  return runtimeBoolean("WSS_ENABLED", false) && /^wss?:\/\//i.test(raw) ? raw : "";
+}
+
+function getStandaloneWebSocketPort(): number | null {
+  const raw = String(process.env.WEBSOCKET_PORT || "").trim();
+  if (!raw) return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function getStandaloneWebSocketHost(): string {
+  const raw = String(process.env.WEBSOCKET_HOST || "").trim();
+  return raw || "0.0.0.0";
+}
+
+function isExecutionDisabledByEnv(): boolean {
+  return (
+    isTruthyFlag(process.env.EXECUTION_DISABLED) ||
+    isTruthyFlag(process.env.DISCOVERY_ONLY_MODE)
+  );
+}
+
+function isExecutionDisabledByConfig(config: Record<string, any>): boolean {
+  return (
+    isTruthyFlag(config.EXECUTION_DISABLED) ||
+    isTruthyFlag(config.DISCOVERY_ONLY_MODE)
+  );
+}
+
+function isExecutionDisabled(config: Record<string, any> = getRuntimeConfig()): boolean {
+  return isExecutionDisabledByConfig(config) || isExecutionDisabledByEnv();
+}
+
+function forceDiscoveryOnlyConfig(config: Record<string, any>, options?: { includeEnvOverrides?: boolean }) {
+  const executionDisabled = isExecutionDisabledByConfig(config) || ((options?.includeEnvOverrides ?? true) && isExecutionDisabledByEnv());
+  if (!executionDisabled) return config;
+  return {
+    ...config,
+    APEX_PIPELINE_MODE: "developer",
+    EXECUTION_DISABLED: true,
+    DISCOVERY_ONLY_MODE: true,
+    LIVE_EXECUTION: false,
+    SHADOW_MODE: true,
+    REQUIRE_FORK_SIM_BEFORE_SUBMIT: true,
+    REQUIRE_CHAIN_ID_MATCH: true,
+    REQUIRE_NONCE_LOCK: true,
+    REQUIRE_GAS_CAP: true,
+    REQUIRE_PROFIT_PROTECTION: true,
+  };
 }
 
 const getModuleStatus = (moduleName: string): boolean => {
@@ -175,6 +325,141 @@ async function queryPolygonRPC(method: string, params: any[]): Promise<any> {
     }
   }
   throw new Error(`CHAIN_137_RPC_UNAVAILABLE: ${errors.join(" | ")}`);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pollForReceipt(hash: string, timeoutMs: number) {
+  const startedAt = Date.now();
+  const backoff = getReceiptWaitBackoffConfig();
+  let delayMs = backoff.initialMs;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const receipt = await queryPolygonRPC("eth_getTransactionReceipt", [hash]);
+      if (receipt) {
+        return {
+          receipt,
+          mode: "HTTP_POLL",
+          waitedMs: Date.now() - startedAt,
+        };
+      }
+    } catch (error: any) {
+      if (!backoff.reconnectEnabled) {
+        return {
+          receipt: null,
+          mode: "HTTP_POLL",
+          waitedMs: Date.now() - startedAt,
+          error: error?.message || "receipt poll failed",
+        };
+      }
+    }
+
+    const remainingMs = timeoutMs - (Date.now() - startedAt);
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(delayMs, remainingMs));
+    delayMs = Math.min(backoff.maxMs, delayMs * 2);
+  }
+
+  return {
+    receipt: null,
+    mode: "HTTP_POLL",
+    waitedMs: Date.now() - startedAt,
+  };
+}
+
+async function waitForReceiptConfirmation(hash: string, timeoutMs: number) {
+  const startedAt = Date.now();
+  const wssProviderUrl = getWssProviderUrl();
+  const priority = getReceiptWaitPriority();
+
+  const tryWss = async () => {
+    if (!wssProviderUrl) {
+      return {
+        receipt: null,
+        mode: "WSS_PROVIDER",
+        waitedMs: 0,
+        error: "WSS_PROVIDER_UNAVAILABLE",
+      };
+    }
+    let provider: ethers.WebSocketProvider | null = null;
+    const wsStartedAt = Date.now();
+    try {
+      provider = new ethers.WebSocketProvider(wssProviderUrl);
+      const receipt = await provider.waitForTransaction(hash, 1, timeoutMs);
+      return {
+        receipt,
+        mode: "WSS_PROVIDER",
+        waitedMs: Date.now() - wsStartedAt,
+      };
+    } catch (error: any) {
+      return {
+        receipt: null,
+        mode: "WSS_PROVIDER",
+        waitedMs: Date.now() - wsStartedAt,
+        error: error?.message || "WSS receipt wait failed",
+      };
+    } finally {
+      try {
+        (provider as any)?.destroy?.();
+      } catch {
+        // Ignore provider cleanup failures.
+      }
+    }
+  };
+
+  if (priority === "HTTP_FIRST") {
+    const pollResult = await pollForReceipt(hash, timeoutMs);
+    if (pollResult.receipt) return pollResult;
+    const remainingMs = Math.max(0, timeoutMs - (Date.now() - startedAt));
+    if (remainingMs <= 0) return pollResult;
+    const wssResult = await tryWss();
+    return {
+      ...wssResult,
+      waitedMs: Date.now() - startedAt,
+      error: wssResult.error || pollResult.error,
+    };
+  }
+
+  const wssResult = await tryWss();
+  if (wssResult.receipt) {
+    return {
+      ...wssResult,
+      waitedMs: Date.now() - startedAt,
+    };
+  }
+
+  const remainingMs = Math.max(0, timeoutMs - (Date.now() - startedAt));
+  if (remainingMs <= 0) {
+    return {
+      ...wssResult,
+      waitedMs: Date.now() - startedAt,
+    };
+  }
+
+  const pollResult = await pollForReceipt(hash, remainingMs);
+  return {
+    ...pollResult,
+    waitedMs: Date.now() - startedAt,
+    error: pollResult.error || wssResult.error,
+  };
+}
+
+async function maybeWaitForSubmittedReceipt(result: any, body?: any) {
+  if (!result?.success || !result?.hash || !shouldWaitForReceipt(body)) return null;
+  const timeoutMs = getReceiptWaitTimeoutMs(body);
+  const waited = await waitForReceiptConfirmation(result.hash, timeoutMs);
+  return {
+    enabled: true,
+    timeoutMs,
+    mode: waited.mode,
+    waitedMs: waited.waitedMs,
+    receiptFound: Boolean(waited.receipt),
+    receiptStatus: waited.receipt?.status || null,
+    error: waited.error || null,
+  };
 }
 
 async function fetchGasGwei(): Promise<number> {
@@ -513,6 +798,18 @@ function solveV2Swap(
   return numerator / denominator;
 }
 
+function parsePositiveNumberList(raw: string | undefined, fallback: number[]) {
+  const values = raw
+    ? raw.split(",").map((item) => Number(item.trim())).filter((value) => Number.isFinite(value) && value > 0)
+    : fallback;
+  return [...new Set(values)].sort((left, right) => left - right);
+}
+
+function envNumber(name: string, fallback: number) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
 function routerForDex(dex: string): string {
   const normalized = dex.toLowerCase();
   if (normalized.includes("sushi")) return SUSHISWAP_V2_ROUTER;
@@ -763,12 +1060,19 @@ async function startServer() {
   const bootConfig = getRuntimeConfig();
   let liveBlockNumber = 0;
   let gasGwei = 0;
-  let isDryRun = bootConfig.SHADOW_MODE !== undefined
+  let isDryRun = isExecutionDisabled(bootConfig)
+    ? true
+    : bootConfig.SHADOW_MODE !== undefined
     ? bootConfig.SHADOW_MODE === true || String(bootConfig.SHADOW_MODE) === "true"
     : bootConfig.LIVE_EXECUTION !== undefined
       ? bootConfig.LIVE_EXECUTION === false || String(bootConfig.LIVE_EXECUTION) === "false"
       : true;
-  defiExecutor.setDryRun(isDryRun);
+  const setExecutionDryRun = (nextDryRun: boolean) => {
+    isDryRun = nextDryRun;
+    defiExecutor.setDryRun(nextDryRun);
+    setRedisLiveExecutionArmed(!nextDryRun && !isExecutionDisabled());
+  };
+  setExecutionDryRun(isDryRun);
   let isEnginePaused = false;
   let lifetimePnl = 0;
   let sessionPnl = 0;
@@ -787,6 +1091,17 @@ async function startServer() {
   let reserveSyncEvents = 0;
   let reserveSyncRate = 0;
   let reserveLastUpdate = 0;
+  let discoveryDiagnostics: Record<string, any> = {
+    summary: "No discovery sweep completed yet",
+    routes_evaluated: 0,
+    reserve_failures: 0,
+    gross_non_positive: 0,
+    post_gas_non_positive: 0,
+    cached_spreads: 0,
+    ready_pools: 0,
+    total_pools: 0,
+    last_scan_ms: 0,
+  };
   
   let globalTxCounter = 0;
   let totalSettledCycles = 0;
@@ -953,6 +1268,252 @@ async function startServer() {
     };
   };
 
+  const executionDisabledPayload = (payloadKind?: string) => ({
+    success: false,
+    dryRun: true,
+    executionDisabled: true,
+    error: "EXECUTION_DISABLED_DISCOVERY_ONLY: live broadcasts are disabled while discovery is being aligned.",
+    ...(payloadKind ? { payloadKind } : {}),
+  });
+
+  const normalizeVmContextForPrecisionGate = (context: any) => {
+    if (!context || typeof context !== "object") throw new Error("CONTEXT_MISSING");
+    if (!Array.isArray(context.steps) || context.steps.length === 0) throw new Error("CONTEXT_STEPS_MISSING");
+    const minNetProfit = BigInt(context.minNetProfit ?? 0);
+    if (minNetProfit <= 0n) throw new Error("CONTEXT_MIN_NET_PROFIT_NOT_POSITIVE");
+    return {
+      profitAsset: ethers.getAddress(context.profitAsset),
+      minNetProfit,
+      nonce: BigInt(context.nonce ?? 0),
+      merkleRoot: context.merkleRoot || ethers.ZeroHash,
+      proof: Array.isArray(context.proof) ? context.proof : [],
+      steps: context.steps.map((step: any, index: number) => ({
+        venue: ethers.getAddress(step.venue),
+        tokenIn: ethers.getAddress(step.tokenIn),
+        tokenOut: ethers.getAddress(step.tokenOut),
+        amountIn: BigInt(step.amountIn ?? 0),
+        minAmountOut: BigInt(step.minAmountOut ?? 0),
+        callValue: BigInt(step.callValue ?? 0),
+        payload: ethers.hexlify(step.payload),
+      })).map((step: any, index: number) => {
+        if (step.amountIn <= 0n) throw new Error(`CONTEXT_STEP_${index}_AMOUNT_IN_NOT_POSITIVE`);
+        if (step.minAmountOut <= 0n) throw new Error(`CONTEXT_STEP_${index}_MIN_AMOUNT_OUT_NOT_POSITIVE`);
+        return step;
+      }),
+    };
+  };
+
+  const assertFlashloanRouteEnvelopeInvariant = (params: {
+    payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS" | "FLASHLOAN_INTEGRATED_C2_PAYLOADS";
+    flashloanAsset: string;
+    flashloanAmount: string | bigint;
+    context: ReturnType<typeof normalizeVmContextForPrecisionGate>;
+  }) => {
+    const flashloanAsset = ethers.getAddress(params.flashloanAsset);
+    const flashloanAmount = BigInt(params.flashloanAmount);
+    const steps = params.context.steps;
+    if (steps.length !== 2 && steps.length !== 3) {
+      throw new Error(`ROUTE_SHAPE_UNSUPPORTED:${steps.length}_LEGS_ONLY_A_B_A_OR_A_B_C_A_ALLOWED`);
+    }
+    if (ethers.getAddress(steps[0].tokenIn).toLowerCase() !== flashloanAsset.toLowerCase()) {
+      throw new Error("FLASHLOAN_ASSET_NOT_LEG1_INPUT");
+    }
+    if (BigInt(steps[0].amountIn) !== flashloanAmount) {
+      throw new Error("FLASHLOAN_AMOUNT_MUST_EQUAL_LEG1_AMOUNT_IN");
+    }
+    for (let index = 1; index < steps.length; index += 1) {
+      if (ethers.getAddress(steps[index - 1].tokenOut).toLowerCase() !== ethers.getAddress(steps[index].tokenIn).toLowerCase()) {
+        throw new Error(`ROUTE_TOKEN_CHAIN_BROKEN_AT_LEG_${index}`);
+      }
+      if (BigInt(steps[index].amountIn) <= 0n) {
+        throw new Error(`ROUTE_AMOUNT_CHAIN_BROKEN_AT_LEG_${index}`);
+      }
+    }
+    if (ethers.getAddress(steps[steps.length - 1].tokenOut).toLowerCase() !== flashloanAsset.toLowerCase()) {
+      throw new Error("ROUTE_FINAL_OUTPUT_NOT_FLASHLOAN_ASSET");
+    }
+    return {
+      ok: true,
+      rule: "FLASHLOAN_AMOUNT_A_EQUALS_INITIAL_AMOUNT_A_EQUALS_LEG1_AMOUNT_IN_A",
+      routeShape: steps.length === 2 ? "A_B_A" : "A_B_C_A",
+      flashloanAmountRaw: flashloanAmount.toString(),
+      firstLegAmountInRaw: BigInt(steps[0].amountIn).toString(),
+      startAsset: flashloanAsset,
+      finalAsset: ethers.getAddress(steps[steps.length - 1].tokenOut),
+    };
+  };
+
+  const buildVmPrecisionCalldata = (params: {
+    payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS" | "FLASHLOAN_INTEGRATED_C2_PAYLOADS";
+    c1InternalId?: string;
+    flashloanSource: number;
+    flashloanAsset: string;
+    flashloanAmount: string | bigint;
+    context: any;
+  }) => {
+    const flashloanAsset = ethers.getAddress(params.flashloanAsset);
+    const flashloanAmount = BigInt(params.flashloanAmount);
+    if (flashloanAmount <= 0n) throw new Error("FLASHLOAN_AMOUNT_NOT_POSITIVE");
+    const context = normalizeVmContextForPrecisionGate(params.context);
+    const routeEnvelopeInvariant = assertFlashloanRouteEnvelopeInvariant({
+      payloadKind: params.payloadKind,
+      flashloanAsset,
+      flashloanAmount,
+      context,
+    });
+    if (params.payloadKind === "FLASHLOAN_INTEGRATED_C1_PAYLOADS") {
+      return {
+        context,
+        routeEnvelopeInvariant,
+        calldata: apexVmExecutionIface.encodeFunctionData("executeC1", [
+          params.flashloanSource,
+          flashloanAsset,
+          flashloanAmount,
+          context,
+        ]),
+      };
+    }
+    if (!ethers.isHexString(params.c1InternalId, 32)) throw new Error("INVALID_C1_INTERNAL_ID");
+    return {
+      context,
+      routeEnvelopeInvariant,
+      calldata: apexVmExecutionIface.encodeFunctionData("executeC2", [
+        params.c1InternalId,
+        params.flashloanSource,
+        flashloanAsset,
+        flashloanAmount,
+        context,
+      ]),
+    };
+  };
+
+  const estimateExecutionGas = async (from: string, to: string, data: string) => {
+    const gasHex = await queryPolygonRPC("eth_estimateGas", [{ from, to, data, value: "0x0" }]);
+    return BigInt(gasHex || "0x0");
+  };
+
+  const assertLockedExecutableLedgerCandidate = async (params: {
+    redisId: string;
+    flashloanAsset: string;
+    flashloanAmount: string | bigint;
+  }) => {
+    if (!params.redisId) throw new Error("REDIS_EXECUTION_LOCK_REQUIRED");
+    const record = await getLedgerOpportunityById(params.redisId);
+    if (!record) throw new Error("LOCKED_OPPORTUNITY_NOT_FOUND");
+    if (record.redisStatus !== "LOCKED_FOR_EXECUTION") throw new Error(`OPPORTUNITY_NOT_LOCKED:${record.redisStatus || "UNKNOWN"}`);
+    if (record.payloadKind !== "FLASHLOAN_INTEGRATED_C1_PAYLOADS") throw new Error("LOCKED_OPPORTUNITY_KIND_MISMATCH");
+    if (record.status !== "EXECUTABLE_PROFIT_CANDIDATE" || !record.c1ExecutionEligible) {
+      throw new Error(`LOCKED_OPPORTUNITY_NOT_EXECUTABLE:${record.status || "UNKNOWN"}`);
+    }
+    if (record.expiresAt && Date.now() > Number(record.expiresAt)) throw new Error("LOCKED_OPPORTUNITY_EXPIRED");
+    const maxAgeMs = Number(process.env.EXECUTION_CANDIDATE_MAX_AGE_MS || process.env.REDIS_OPPORTUNITY_TTL_MS || 120_000);
+    if (record.lastSeenAt && Date.now() - Number(record.lastSeenAt) > maxAgeMs) throw new Error("LOCKED_OPPORTUNITY_STALE");
+    if (record.flashloanAsset && ethers.getAddress(record.flashloanAsset).toLowerCase() !== ethers.getAddress(params.flashloanAsset).toLowerCase()) {
+      throw new Error("LOCKED_OPPORTUNITY_FLASHLOAN_ASSET_MISMATCH");
+    }
+    if (record.amountIn !== undefined && BigInt(record.amountIn) !== BigInt(params.flashloanAmount)) {
+      throw new Error("LOCKED_OPPORTUNITY_FLASHLOAN_AMOUNT_MISMATCH");
+    }
+    const minProfitUsd = Number(process.env.MIN_NET_PROFIT_USD || 5);
+    const netProfitUsd = Number(record.netProfitUsd ?? record.profit_usd);
+    if (!Number.isFinite(netProfitUsd) || netProfitUsd < minProfitUsd) {
+      throw new Error(`LOCKED_OPPORTUNITY_NET_PROFIT_BELOW_MIN:${Number.isFinite(netProfitUsd) ? netProfitUsd.toFixed(6) : "UNPRICED"}<${minProfitUsd}`);
+    }
+    const priceVariance = record.priceVariance;
+    if (priceVariance && priceVariance.ok !== true) {
+      throw new Error(`LOCKED_OPPORTUNITY_PRICE_VARIANCE_REJECTED:${priceVariance.reason || "UNKNOWN"}`);
+    }
+    if (priceVariance?.mode === "DIRECT_TWO_LEG") {
+      const leg1BuyPrice = Number(priceVariance.leg1BuyPrice ?? record.leg1BuyPrice);
+      const leg2SellPrice = Number(priceVariance.leg2SellPrice ?? record.leg2SellPrice);
+      if (!Number.isFinite(leg1BuyPrice) || !Number.isFinite(leg2SellPrice) || !(leg1BuyPrice < leg2SellPrice)) {
+        throw new Error(`LOCKED_OPPORTUNITY_LEG_PRICE_INVARIANT_FAILED:${leg1BuyPrice}>=${leg2SellPrice}`);
+      }
+    }
+    return record;
+  };
+
+  const elitePrecisionPreBroadcastGate = async (params: {
+    payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS" | "FLASHLOAN_INTEGRATED_C2_PAYLOADS";
+    targetContract: string;
+    c1InternalId?: string;
+    flashloanSource: number;
+    flashloanAsset: string;
+    flashloanAmount: string | bigint;
+    context: any;
+    redisId?: string;
+  }) => {
+    if (!defiExecutor.isArmed()) {
+      throw new Error("LIVE_ARM_BLOCKED: executor signer is not available or runtime is still dry-run.");
+    }
+    const targetContract = ethers.getAddress(params.targetContract);
+    const signer = defiExecutor.getWalletAddress();
+    if (!ethers.isAddress(signer) || signer === ethers.ZeroAddress) throw new Error("EXECUTOR_SIGNER_UNAVAILABLE");
+    const chainId = await queryPolygonRPC("eth_chainId", []);
+    if (chainId !== "0x89") throw new Error(`CHAIN_ID_MISMATCH:${chainId}`);
+    const { calldata, context, routeEnvelopeInvariant } = buildVmPrecisionCalldata(params);
+    const ledgerRecord = params.payloadKind === "FLASHLOAN_INTEGRATED_C1_PAYLOADS"
+      ? await assertLockedExecutableLedgerCandidate({
+          redisId: params.redisId || "",
+          flashloanAsset: params.flashloanAsset,
+          flashloanAmount: params.flashloanAmount,
+        })
+      : null;
+    const preflight = await preflightVmCalldata(signer, targetContract, calldata);
+    if (!preflight.ok) throw new Error(`PREFLIGHT_CALL_BLOCKED:${preflight.reason}`);
+    const [estimatedGasUnits, gasPriceHex] = await Promise.all([
+      estimateExecutionGas(signer, targetContract, calldata),
+      queryPolygonRPC("eth_gasPrice", []),
+    ]);
+    const gasPriceWei = BigInt(gasPriceHex || "0x0");
+    const nativeUsd = Number(process.env.NATIVE_TOKEN_USD || 1);
+    const gasCostUsd = Number(estimatedGasUnits * gasPriceWei) / 1e18 * nativeUsd;
+    const minProfitUsd = Number(process.env.MIN_NET_PROFIT_USD || 5);
+    const ledgerNetProfitUsd = ledgerRecord ? Number(ledgerRecord.netProfitUsd ?? ledgerRecord.profit_usd) : undefined;
+    const ledgerGasCostUsd = ledgerRecord ? Number(ledgerRecord.gasCostUsd ?? 0) : 0;
+    const adjustedNetProfitUsd = ledgerNetProfitUsd === undefined
+      ? undefined
+      : ledgerNetProfitUsd - Math.max(0, gasCostUsd - ledgerGasCostUsd);
+    if (adjustedNetProfitUsd !== undefined && adjustedNetProfitUsd < minProfitUsd) {
+      throw new Error(`GAS_ADJUSTED_NET_PROFIT_BELOW_MIN:${adjustedNetProfitUsd.toFixed(6)}<${minProfitUsd}`);
+    }
+    return {
+      ok: true,
+      gate: "APEX_OMEGA_2_0_ELITE_PRECISION_PROFIT_GATE",
+      payloadKind: params.payloadKind,
+      routeId: ledgerRecord?.routeId,
+      redisId: params.redisId,
+      chainId,
+      signer,
+      targetContract,
+      calldataHash: ethers.keccak256(calldata),
+      preflight,
+      estimatedGasUnits: estimatedGasUnits.toString(),
+      gasPriceWei: gasPriceWei.toString(),
+      gasCostUsd,
+      minProfitUsd,
+      ledgerNetProfitUsd,
+      adjustedNetProfitUsd,
+      priceVariance: ledgerRecord?.priceVariance,
+      leg1BuyPrice: ledgerRecord?.leg1BuyPrice,
+      leg2SellPrice: ledgerRecord?.leg2SellPrice,
+      priceEdgeBps: ledgerRecord?.priceEdgeBps,
+      routeEnvelopeInvariant,
+      profitAsset: context.profitAsset,
+      minNetProfitRaw: context.minNetProfit.toString(),
+      steps: context.steps.length,
+      decision: "ALLOW_BROADCAST",
+    };
+  };
+
+  const profitAssetFromContext = (context: any) => {
+    try {
+      return ethers.getAddress(context?.profitAsset || getConfiguredProfitAsset());
+    } catch {
+      return getConfiguredProfitAsset();
+    }
+  };
+
   const evaluateC2DecisionForBlock = async (instance: C2Instance, currentBlock: number): Promise<C2DecisionRecord> => {
     const cfg = getRuntimeConfig();
     const targetContract = instance.seed.targetContract || cfg.C2_ARB_EXECUTOR_ADDRESS || cfg.C2_TARGET || cfg.C1_ARB_EXECUTOR_ADDRESS || cfg.C1_TARGET || cfg.ARB_CONTRACT_ADDRESS;
@@ -960,6 +1521,19 @@ async function startServer() {
       blockNumber: currentBlock,
       createdAt: Date.now(),
     };
+
+    if (isExecutionDisabled(cfg)) {
+      return {
+        ...baseRecord,
+        decision: "DO_NOTHING",
+        routeEvaluation: {
+          listener: "C2_BLOCK_LISTENER",
+          gate: "EXECUTION_DISABLED_DISCOVERY_ONLY",
+          txCreated: false,
+        },
+        result: executionDisabledPayload("FLASHLOAN_INTEGRATED_C2_PAYLOADS"),
+      };
+    }
 
     const lockPayload = {
       routeId: `C2:${instance.c1Hash}:${currentBlock}`,
@@ -987,6 +1561,15 @@ async function startServer() {
     try {
       if (c2MirrorEnabled && targetContract && instance.seed.context) {
         const mirrorContext = await withFreshVmNonce(targetContract, instance.seed.context);
+        const mirrorPrecisionGate = await elitePrecisionPreBroadcastGate({
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+          targetContract,
+          c1InternalId: instance.c1InternalId,
+          flashloanSource: Number(instance.seed.flashloanSource ?? DEFAULT_FLASHLOAN_SOURCE_AAVE_V3),
+          flashloanAsset: instance.seed.flashloanAsset,
+          flashloanAmount: instance.seed.flashloanAmount,
+          context: mirrorContext,
+        });
         const mirrorResult = await defiExecutor.broadcastFlashloanIntegratedC2Payload(
           targetContract,
           instance.c1InternalId,
@@ -1007,10 +1590,11 @@ async function startServer() {
             decision: "MIRROR",
             txHash: mirrorResult.hash,
             txHashLink: mirrorResult.hashLink || getExplorerTxLink(mirrorResult.hash),
-            result: mirrorResult,
+            result: { ...mirrorResult, precisionGate: mirrorPrecisionGate },
             routeEvaluation: {
               listener: "C2_BLOCK_LISTENER",
               gate: "MIRROR_FORK_SIM_AND_PROFIT_GATES_PASSED",
+              precisionGate: mirrorPrecisionGate,
               reusedPrecedingPayloadContext: true,
               txCreated: true,
             },
@@ -1021,6 +1605,15 @@ async function startServer() {
           const reversePayload = buildReverseC2PayloadFromSeed(instance);
           if (reversePayload.ok) {
             const reverseContext = await withFreshVmNonce(targetContract, reversePayload.context);
+            const reversePrecisionGate = await elitePrecisionPreBroadcastGate({
+              payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+              targetContract,
+              c1InternalId: instance.c1InternalId,
+              flashloanSource: reversePayload.flashloanSource,
+              flashloanAsset: reversePayload.flashloanAsset,
+              flashloanAmount: reversePayload.flashloanAmount,
+              context: reverseContext,
+            });
             const reverseResult = await defiExecutor.broadcastFlashloanIntegratedC2Payload(
               targetContract,
               instance.c1InternalId,
@@ -1040,10 +1633,11 @@ async function startServer() {
                 decision: "REVERSE",
                 txHash: reverseResult.hash,
                 txHashLink: reverseResult.hashLink || getExplorerTxLink(reverseResult.hash),
-                result: reverseResult,
+                result: { ...reverseResult, precisionGate: reversePrecisionGate },
                 routeEvaluation: {
                   listener: "C2_BLOCK_LISTENER",
                   gate: "REVERSE_FORK_SIM_AND_PROFIT_GATES_PASSED",
+                  precisionGate: reversePrecisionGate,
                   newFlashloanSize: reversePayload.flashloanAmount,
                   txCreated: true,
                 },
@@ -1233,7 +1827,7 @@ async function startServer() {
             totalSettledCycles++;
             bumpStage("C2_EXECUTION");
             const profitReceiver = getConfiguredProfitReceiver();
-            const profitAsset = getConfiguredProfitAsset();
+            const profitAsset = decision.result?.precisionGate?.profitAsset || profitAssetFromContext(instance.seed.context);
             pendingSettlements.set(decision.txHash.toLowerCase(), {
               payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
               hash: decision.txHash,
@@ -1432,11 +2026,27 @@ async function startServer() {
       ],
     });
 
-    const liveReady = rpcPassed && signerReady && !isDryRun && !isEnginePaused;
+    const executionDisabled = isExecutionDisabled();
+    stages.push({
+      name: "Execution Kill Switch",
+      passed: !executionDisabled,
+      checks: [
+        {
+          name: "Discovery-only mode",
+          passed: !executionDisabled,
+          status: executionDisabled ? "ENABLED" : "OFF",
+          detail: executionDisabled ? "Live broadcasts are intentionally disabled." : "Execution switch is not blocking.",
+        },
+      ],
+    });
+
+    const liveReady = rpcPassed && signerReady && !isDryRun && !isEnginePaused && !executionDisabled;
     const blockingCount = stages.filter((stage) => !stage.passed).length + (isDryRun ? 1 : 0) + (isEnginePaused ? 1 : 0);
 
     res.json({
+      apexPipeline: apexPipelineCapabilities(),
       dry_run: isDryRun,
+      execution_disabled: executionDisabled,
       ready: liveReady,
       status: liveReady ? "LIVE_READY" : "BLOCKED",
       blocking_count: blockingCount,
@@ -1497,6 +2107,7 @@ async function startServer() {
   app.get("/api/execution/pipeline", (req, res) => {
     const c2DecisionCount = [...c2Instances.values()].reduce((sum, instance) => sum + instance.decisions.length, 0);
     res.json({
+      apexPipeline: apexPipelineCapabilities(),
       stages: pipelineStages.map((stage) => {
         if (stage.name === "ARCHIVE") return { ...stage, count: totalTrades };
         return stage;
@@ -1542,9 +2153,13 @@ async function startServer() {
     res.json({
       pause: { active: isEnginePaused },
       mode: {
-        LIVE_EXECUTION: String(!isDryRun),
-        SHADOW_MODE: String(isDryRun),
+        APEX_PIPELINE_MODE: getApexPipelineMode(),
+        LIVE_EXECUTION: String(!isDryRun && !isExecutionDisabled()),
+        SHADOW_MODE: String(isDryRun || isExecutionDisabled()),
+        EXECUTION_DISABLED: String(isExecutionDisabled()),
+        DISCOVERY_ONLY_MODE: String(isExecutionDisabled()),
       },
+      apexPipeline: apexPipelineCapabilities(),
     });
   });
 
@@ -1554,8 +2169,65 @@ async function startServer() {
     const activeRouteCount = await getActiveLedgerCount().catch(() => null);
     const c1ExecutableVisible = activeOpportunities.filter((item: any) => item.c1ExecutionEligible || item.executionReady).length;
     const c2DecisionCount = [...c2Instances.values()].reduce((sum, instance) => sum + instance.decisions.length, 0);
+    const assetGroup = (symbol?: string) => {
+      const normalized = String(symbol || "").toUpperCase().replace(/[^A-Z0-9.]/g, "");
+      if (["USDC", "USDC.E", "USDT", "USDT0", "DAI", "MAI", "MIMATIC"].includes(normalized)) return "USD_STABLES";
+      if (["WPOL", "WMATIC", "POL", "MATIC"].includes(normalized)) return "POL_MATIC";
+      if (["WETH", "ETH"].includes(normalized)) return "ETH";
+      if (["WBTC", "BTC"].includes(normalized)) return "BTC";
+      return normalized || "OTHER";
+    };
+    const discoveryGraph = Object.values(activeOpportunities.reduce((acc: Record<string, any>, opp: any) => {
+      const key = assetGroup(opp.flashloanSymbol || String(opp.pair || "").split(" ")[0]);
+      const group = acc[key] || {
+        group: key,
+        symbols: new Set<string>(),
+        routes: 0,
+        direct: 0,
+        autoReverse: 0,
+        executable: 0,
+        blocked: 0,
+        naiveReversePositive: 0,
+        bestEdgeBps: Number.NEGATIVE_INFINITY,
+        bestNaiveReverseEdgeBps: Number.NEGATIVE_INFINITY,
+        bestRoute: null,
+        bestReason: null,
+      };
+      const executable = Boolean(opp.c1ExecutionEligible || opp.executionReady || opp.status === "EXECUTABLE_PROFIT_CANDIDATE");
+      const edge = Number(opp.priceEdgeBps);
+      const naiveReverseEdge = Number(opp.reverseMathHint?.naiveReverseEdgeBps ?? opp.priceVariance?.reverseMathHint?.naiveReverseEdgeBps);
+      group.routes += 1;
+      group.direct += opp.routeOrientation === "AUTO_REVERSE" ? 0 : 1;
+      group.autoReverse += opp.routeOrientation === "AUTO_REVERSE" ? 1 : 0;
+      group.executable += executable ? 1 : 0;
+      group.blocked += executable ? 0 : 1;
+      group.naiveReversePositive += Number.isFinite(naiveReverseEdge) && naiveReverseEdge > 0 ? 1 : 0;
+      if (opp.flashloanSymbol) group.symbols.add(opp.flashloanSymbol);
+      if (Number.isFinite(edge) && edge > group.bestEdgeBps) {
+        group.bestEdgeBps = edge;
+        group.bestRoute = opp.routeId || opp.path || null;
+        group.bestReason = opp.reason || null;
+      }
+      if (Number.isFinite(naiveReverseEdge) && naiveReverseEdge > group.bestNaiveReverseEdgeBps) {
+        group.bestNaiveReverseEdgeBps = naiveReverseEdge;
+      }
+      acc[key] = group;
+      return acc;
+    }, {})).map((group: any) => ({
+      ...group,
+      symbols: Array.from(group.symbols),
+      bestEdgeBps: Number.isFinite(group.bestEdgeBps) ? group.bestEdgeBps : null,
+      bestNaiveReverseEdgeBps: Number.isFinite(group.bestNaiveReverseEdgeBps) ? group.bestNaiveReverseEdgeBps : null,
+      invariant: "EXECUTABLE_ONLY_IF_BUY_PRICE_LEG1_LT_SELL_PRICE_LEG2_AND_NET_PROFIT_AFTER_GAS_FEE",
+    })).sort((left: any, right: any) => right.routes - left.routes);
+    const opportunitySummary = c1ExecutableVisible > 0
+      ? "Live arbitrage scanner found executable spread candidates."
+      : activeOpportunities.length > 0
+        ? "Live arbitrage scanner ranked routes, but none passed execution gates."
+        : "No live executable spreads observed.";
     res.json({
       opportunities: activeOpportunities,
+      discoveryGraph,
       source: "live",
       redisLedger: getRedisLedgerStatus(),
       routeLimits: {
@@ -1571,15 +2243,26 @@ async function startServer() {
         c2RequiresConfirmedC1: true,
       },
       diagnostics: {
-        summary: activeOpportunities.length ? "Live arbitrage scanner found executable spread candidates." : "No live executable spreads observed.",
-        profit_gate: { blocked_count: 0 },
-        gas_gate: { blocked_count: 0 },
+        summary: opportunitySummary,
+        profit_gate: {
+          blocked_count: Number(discoveryDiagnostics.gross_non_positive || 0),
+          gross_non_positive: Number(discoveryDiagnostics.gross_non_positive || 0),
+        },
+        gas_gate: {
+          blocked_count: Number(discoveryDiagnostics.post_gas_non_positive || 0),
+          post_gas_non_positive: Number(discoveryDiagnostics.post_gas_non_positive || 0),
+        },
         slippage_gate: { blocked_count: 0 },
         discovery: {
           ready_pools: reservePoolsCount,
-          total_pools: pools.length,
-          scanable_pairs: pools.length,
+          total_pools: Number(discoveryDiagnostics.total_pools || reservePoolsCount || pools.length),
+          scanable_pairs: Number(discoveryDiagnostics.scanable_pairs || discoveryDiagnostics.routes_evaluated || activeOpportunities.length || pools.length),
           cached_spreads: activeOpportunities.length,
+          routes_evaluated: Number(discoveryDiagnostics.routes_evaluated || 0),
+          reserve_failures: Number(discoveryDiagnostics.reserve_failures || 0),
+          gross_non_positive: Number(discoveryDiagnostics.gross_non_positive || 0),
+          post_gas_non_positive: Number(discoveryDiagnostics.post_gas_non_positive || 0),
+          last_scan_ms: Number(discoveryDiagnostics.last_scan_ms || 0),
           total_routes_observed: activeRouteCount ?? activeOpportunities.length,
           top_50_routes_visible: Math.min(activeOpportunities.length, TOP_ROUTE_DISPLAY_LIMIT),
           c1_executable_visible: c1ExecutableVisible,
@@ -1587,7 +2270,7 @@ async function startServer() {
           c2_per_c1_limit: C2_PER_C1_LIMIT,
           c2_decision_limit_per_cycle: C2_DECISION_LIMIT_PER_CYCLE,
           c2_decision_count: c2DecisionCount,
-          summary: reservePoolsCount > 0 ? "Live reserves polled successfully" : "Awaiting live reserve sync",
+          summary: discoveryDiagnostics.summary || opportunitySummary,
         },
       },
     });
@@ -1603,12 +2286,31 @@ async function startServer() {
   });
 
   // Controls Posting Triggers
-  app.post("/api/chains/scan-all", (req, res) => {
-    reserveDirtyCount = 0;
-    reserveLastUpdate = Date.now();
+  app.post("/api/chains/scan-all", async (req, res) => {
+    const sweep = await proactiveArbSweep();
+    if (!sweep.ran) {
+      return res.status(sweep.skippedReason === "ENGINE_PAUSED" ? 423 : 409).json({
+        success: false,
+        skipped: true,
+        reason: sweep.skippedReason,
+        message: sweep.skippedReason === "ENGINE_PAUSED"
+          ? "AMM pool synchronization skipped because the engine is paused."
+          : "AMM pool synchronization skipped because another sweep is already in progress.",
+        diagnostics: sweep.diagnostics,
+      });
+    }
+    if (!sweep.ok) {
+      return res.status(500).json({
+        success: false,
+        message: "AMM pool synchronization failed.",
+        error: sweep.error || sweep.diagnostics?.error || "unknown error",
+        diagnostics: sweep.diagnostics,
+      });
+    }
     res.json({
       success: true,
       message: "On-demand AMM pool synchronization complete.",
+      diagnostics: sweep.diagnostics,
     });
   });
 
@@ -1623,29 +2325,44 @@ async function startServer() {
   });
 
   app.post("/api/execution/monitor-only", (req, res) => {
-    isDryRun = true;
-    defiExecutor.setDryRun(true);
+    setExecutionDryRun(true);
     res.json({ success: true, dryRun: true, monitorOnly: true });
   });
 
   app.post("/api/execution/arm-live", (req, res) => {
-    defiExecutor.setDryRun(false);
+    if (getApexPipelineMode() !== "live") {
+      setExecutionDryRun(true);
+      return res.status(409).json({
+        success: false,
+        dryRun: true,
+        error: "LIVE_ARM_BLOCKED: APEX_PIPELINE_MODE must be live before wallet signing or tx submission.",
+        apexPipeline: apexPipelineCapabilities(),
+      });
+    }
+    if (isExecutionDisabled()) {
+      setExecutionDryRun(true);
+      return res.status(423).json(executionDisabledPayload());
+    }
+    setExecutionDryRun(false);
     if (!defiExecutor.isArmed()) {
-      defiExecutor.setDryRun(true);
-      isDryRun = true;
+      setExecutionDryRun(true);
       return res.status(409).json({
         success: false,
         dryRun: true,
         error: "LIVE_ARM_BLOCKED: executor signer is not available.",
       });
     }
-    isDryRun = false;
+    setExecutionDryRun(false);
     res.json({ success: true, dryRun: false });
   });
 
 
   app.post("/api/execution/c1", async (req, res) => {
     try {
+      if (isExecutionDisabled()) {
+        setExecutionDryRun(true);
+        return res.status(423).json(executionDisabledPayload("FLASHLOAN_INTEGRATED_C1_PAYLOADS"));
+      }
       const cfg = getRuntimeConfig();
       const targetContract = req.body.targetContract || cfg.C1_ARB_EXECUTOR_ADDRESS || cfg.C1_TARGET || cfg.ARB_CONTRACT_ADDRESS;
       const flashloanSource = Number(req.body.flashloanSource ?? DEFAULT_FLASHLOAN_SOURCE_AAVE_V3);
@@ -1662,6 +2379,34 @@ async function startServer() {
         });
       }
 
+      let precisionGate: any;
+      try {
+        precisionGate = await elitePrecisionPreBroadcastGate({
+          payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
+          targetContract,
+          flashloanSource,
+          flashloanAsset,
+          flashloanAmount,
+          context,
+          redisId,
+        });
+      } catch (error: any) {
+        if (redisId) {
+          await releaseOpportunityLock(redisId, "C1_PRECISION_GATE_REJECTED", {
+            error: error?.message || "Precision gate rejected C1 payload",
+            payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
+          });
+        }
+        return res.status(409).json({
+          success: false,
+          payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
+          error: error?.message || "PRECISION_PROFIT_GATE_REJECTED",
+          gate: "APEX_OMEGA_2_0_ELITE_PRECISION_PROFIT_GATE",
+          txCreated: false,
+          pnlUpdated: false,
+        });
+      }
+
       const result = await defiExecutor.broadcastFlashloanIntegratedC1Payload(targetContract, flashloanSource, flashloanAsset, flashloanAmount, context);
 
       if (result.success) {
@@ -1670,7 +2415,7 @@ async function startServer() {
         bumpStage("C1_EXECUTION");
         if (result.hash) {
           const profitReceiver = getConfiguredProfitReceiver();
-          const profitAsset = getConfiguredProfitAsset();
+          const profitAsset = precisionGate.profitAsset || profitAssetFromContext(context);
           pendingSettlements.set(result.hash.toLowerCase(), {
             payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
             hash: result.hash,
@@ -1705,7 +2450,7 @@ async function startServer() {
         });
       }
 
-      res.status(result.success ? 200 : 409).json(result);
+      res.status(result.success ? 200 : 409).json({ ...result, precisionGate });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err?.message || "C1 execution failed", payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS" });
     }
@@ -1713,6 +2458,10 @@ async function startServer() {
 
   app.post("/api/execution/c2", async (req, res) => {
     try {
+      if (isExecutionDisabled()) {
+        setExecutionDryRun(true);
+        return res.status(423).json(executionDisabledPayload("FLASHLOAN_INTEGRATED_C2_PAYLOADS"));
+      }
       const cfg = getRuntimeConfig();
       const targetContract = req.body.targetContract || cfg.C2_ARB_EXECUTOR_ADDRESS || cfg.C2_TARGET || cfg.C1_ARB_EXECUTOR_ADDRESS || cfg.C1_TARGET || cfg.ARB_CONTRACT_ADDRESS;
       const c1InternalId = req.body.c1InternalId;
@@ -1779,13 +2528,35 @@ async function startServer() {
         });
       }
 
+      let precisionGate: any;
+      try {
+        precisionGate = await elitePrecisionPreBroadcastGate({
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+          targetContract,
+          c1InternalId,
+          flashloanSource,
+          flashloanAsset,
+          flashloanAmount,
+          context,
+        });
+      } catch (error: any) {
+        return res.status(409).json({
+          success: false,
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+          error: error?.message || "PRECISION_PROFIT_GATE_REJECTED",
+          gate: "APEX_OMEGA_2_0_ELITE_PRECISION_PROFIT_GATE",
+          txCreated: false,
+          pnlUpdated: false,
+        });
+      }
+
       const result = await defiExecutor.broadcastFlashloanIntegratedC2Payload(targetContract, c1InternalId, flashloanSource, flashloanAsset, flashloanAmount, context);
       const record: C2DecisionRecord = {
         blockNumber: currentBlock,
         decision: "MIRROR",
         createdAt: Date.now(),
-        routeEvaluation: { source: "DIRECT_C2_ENDPOINT", gate: result.success ? "ACTIONABLE" : "BLOCKED" },
-        result,
+        routeEvaluation: { source: "DIRECT_C2_ENDPOINT", gate: result.success ? "ACTIONABLE" : "BLOCKED", precisionGate },
+        result: { ...result, precisionGate },
       };
 
       if (result.success) {
@@ -1796,7 +2567,7 @@ async function startServer() {
           record.txHash = result.hash;
           record.txHashLink = result.hashLink || getExplorerTxLink(result.hash);
           const profitReceiver = getConfiguredProfitReceiver();
-          const profitAsset = getConfiguredProfitAsset();
+          const profitAsset = precisionGate.profitAsset || profitAssetFromContext(context);
           pendingSettlements.set(result.hash.toLowerCase(), {
             payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
             hash: result.hash,
@@ -1817,7 +2588,7 @@ async function startServer() {
         pairedC1Instance.finalDecision = pairedC1Instance.finalDecision || "EXPIRED";
       }
 
-      res.status(result.success ? 200 : 409).json(result);
+      res.status(result.success ? 200 : 409).json({ ...result, precisionGate });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err?.message || "C2 execution failed", payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS" });
     }
@@ -1833,6 +2604,10 @@ async function startServer() {
 
   app.post("/api/execution/c2/evaluate", async (req, res) => {
     try {
+      if (isExecutionDisabled()) {
+        setExecutionDryRun(true);
+        return res.status(423).json(executionDisabledPayload("FLASHLOAN_INTEGRATED_C2_PAYLOADS"));
+      }
       const c1Hash = String(req.body?.c1Hash || "").trim().toLowerCase();
       const decision = String(req.body?.decision || "").trim().toUpperCase() as C2DecisionKind;
       if (!/^0x[a-fA-F0-9]{64}$/.test(c1Hash)) {
@@ -1945,6 +2720,48 @@ async function startServer() {
       }
       const c2Context = await withFreshVmNonce(targetContract, context);
 
+      let precisionGate: any;
+      try {
+        precisionGate = await elitePrecisionPreBroadcastGate({
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+          targetContract,
+          c1InternalId: instance.c1InternalId,
+          flashloanSource,
+          flashloanAsset,
+          flashloanAmount,
+          context: c2Context,
+        });
+      } catch (error: any) {
+        const record: C2DecisionRecord = {
+          blockNumber: currentBlock,
+          decision,
+          createdAt: Date.now(),
+          routeEvaluation: {
+            ...(req.body?.routeEvaluation || {}),
+            gate: "APEX_OMEGA_2_0_ELITE_PRECISION_PROFIT_GATE",
+            rejection: error?.message || "PRECISION_PROFIT_GATE_REJECTED",
+          },
+          result: {
+            success: false,
+            payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+            error: error?.message || "PRECISION_PROFIT_GATE_REJECTED",
+          },
+        };
+        instance.decisions.push(record);
+        bumpStage("C2_ACTION");
+        return res.status(409).json({
+          success: false,
+          decision,
+          txCreated: false,
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+          error: error?.message || "PRECISION_PROFIT_GATE_REJECTED",
+          gate: "APEX_OMEGA_2_0_ELITE_PRECISION_PROFIT_GATE",
+          currentBlock,
+          pnlUpdated: false,
+          instance: serializeC2Instance(instance),
+        });
+      }
+
       const result = await defiExecutor.broadcastFlashloanIntegratedC2Payload(
         targetContract,
         instance.c1InternalId,
@@ -1958,8 +2775,8 @@ async function startServer() {
         blockNumber: currentBlock,
         decision,
         createdAt: Date.now(),
-        routeEvaluation: req.body?.routeEvaluation || { gate: "ACTIONABLE" },
-        result,
+        routeEvaluation: { ...(req.body?.routeEvaluation || {}), gate: result.success ? "ACTIONABLE" : "BLOCKED", precisionGate },
+        result: { ...result, precisionGate },
       };
 
       if (result.success && result.hash) {
@@ -1975,7 +2792,7 @@ async function startServer() {
         bumpStage("C2_EXECUTION");
 
         const profitReceiver = getConfiguredProfitReceiver();
-        const profitAsset = getConfiguredProfitAsset();
+        const profitAsset = precisionGate.profitAsset || profitAssetFromContext(c2Context);
         pendingSettlements.set(result.hash.toLowerCase(), {
           payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
           hash: result.hash,
@@ -2006,7 +2823,7 @@ async function startServer() {
         hashLink: result.hashLink || (result.hash ? getExplorerTxLink(result.hash) : null),
         pnlUpdated: false,
         currentBlock,
-        result,
+        result: { ...result, precisionGate },
         instance: serializeC2Instance(instance),
       });
     } catch (err: any) {
@@ -2215,6 +3032,7 @@ async function startServer() {
       const envDefaults = compactConfigDefaults({
         LIVE_EXECUTION: process.env.LIVE_EXECUTION === undefined ? undefined : process.env.LIVE_EXECUTION === "true",
         SHADOW_MODE: process.env.SHADOW_MODE === undefined ? undefined : process.env.SHADOW_MODE === "true",
+        APEX_PIPELINE_MODE: process.env.APEX_PIPELINE_MODE,
         REQUIRE_FORK_SIM_BEFORE_SUBMIT: process.env.REQUIRE_FORK_SIM_BEFORE_SUBMIT === undefined ? undefined : process.env.REQUIRE_FORK_SIM_BEFORE_SUBMIT === "true",
         REQUIRE_CHAIN_ID_MATCH: process.env.REQUIRE_CHAIN_ID_MATCH === undefined ? undefined : process.env.REQUIRE_CHAIN_ID_MATCH === "true",
         REQUIRE_NONCE_LOCK: process.env.REQUIRE_NONCE_LOCK === undefined ? undefined : process.env.REQUIRE_NONCE_LOCK === "true",
@@ -2251,7 +3069,7 @@ async function startServer() {
         PUBLIC_POLYGON_RPC: process.env.PUBLIC_POLYGON_RPC
       });
 
-      const finalCfg = { ...envDefaults, ...cfg };
+      const finalCfg = forceDiscoveryOnlyConfig({ ...envDefaults, ...cfg });
       return res.json({
         ...finalCfg,
         __meta: {
@@ -2272,19 +3090,22 @@ async function startServer() {
     try {
       const { __meta, ...updated } = req.body || {};
       const current = readConfigFile();
-      const merged = { ...current, ...updated };
+      const merged = forceDiscoveryOnlyConfig({ ...current, ...updated }, { includeEnvOverrides: false });
       writeConfigFileAtomic(merged);
 
       // Sync variables in-memory
-      if (merged.SHADOW_MODE !== undefined) {
-        isDryRun =
-          merged.SHADOW_MODE === true || String(merged.SHADOW_MODE) === "true";
+      if (isExecutionDisabled(merged)) {
+        setExecutionDryRun(true);
+      } else if (merged.SHADOW_MODE !== undefined) {
+        setExecutionDryRun(
+          merged.SHADOW_MODE === true || String(merged.SHADOW_MODE) === "true",
+        );
       } else if (merged.LIVE_EXECUTION !== undefined) {
-        isDryRun =
+        setExecutionDryRun(
           merged.LIVE_EXECUTION === false ||
-          String(merged.LIVE_EXECUTION) === "false";
+          String(merged.LIVE_EXECUTION) === "false",
+        );
       }
-      defiExecutor.setDryRun(isDryRun);
       defiExecutor.setRpcUrl(getRpcUrl());
 
       systemLogQueue.push({ tag: "SYS", message: `Persistent configuration saved to ${CONFIG_PATH}. Runtime mode: ${isDryRun ? "MONITOR_ONLY" : "LIVE_ARM_REQUESTED"}.` });
@@ -2360,74 +3181,110 @@ async function startServer() {
 
   let isProactiveScannerRunning = false;
   async function proactiveArbSweep() {
-     if (isProactiveScannerRunning || isEnginePaused) return;
+     if (isProactiveScannerRunning) {
+       return {
+         ok: false,
+         ran: false,
+         skippedReason: "SCAN_IN_PROGRESS",
+         diagnostics: discoveryDiagnostics,
+       };
+     }
+     if (isEnginePaused) {
+       return {
+         ok: false,
+         ran: false,
+         skippedReason: "ENGINE_PAUSED",
+         diagnostics: {
+           ...discoveryDiagnostics,
+           paused: true,
+         },
+       };
+     }
      isProactiveScannerRunning = true;
+     const startedAt = Date.now();
      try {
-       const activeRoutes = ["ROUTE-01", "ROUTE-02"];
-       const newOpportunities: any[] = [];
-       const livePoolAddresses = new Set<string>();
-
-       for (const activeRouteId of activeRoutes) {
-         const pool1 = activeRouteId === "ROUTE-02" ? pools[2] : pools[0];
-         const pool2 = activeRouteId === "ROUTE-02" ? pools[0] : pools[2];
-         const assetSymbol = "WETH";
-         const decimals = 18;
-
-         const live1 = await fetchV2Reserves(pool1.pairAddress);
-         const live2 = await fetchV2Reserves(pool2.pairAddress);
-         if (!live1.success || !live2.success) continue;
-
-         livePoolAddresses.add(pool1.pairAddress.toLowerCase());
-         livePoolAddresses.add(pool2.pairAddress.toLowerCase());
-
-         const inputAmount = 15000;
-         const amountInUSDC = BigInt(Math.floor(inputAmount * 10 ** 6));
-         const assetBought = solveV2Swap(amountInUSDC, live1.reserve0, live1.reserve1, 30);
-         const usdcOut = solveV2Swap(assetBought, live2.reserve1, live2.reserve0, 30);
-         const usdcReceivedFloat = Number(usdcOut) / 10 ** 6;
-
-         if (usdcReceivedFloat <= inputAmount) continue;
-
-         const gasPrice = gasGwei || await fetchGasGwei();
-         const estimatedGasUsed = 300000;
-         const gasCostUsd = ((estimatedGasUsed * gasPrice) / 1e9) * (globalPrices["POL / MATIC"] || 0);
-         const grossProfit = usdcReceivedFloat - inputAmount;
-         const netProfit = grossProfit - gasCostUsd;
-         if (netProfit <= 0) continue;
-
-         const spreadBps = Math.floor((grossProfit / inputAmount) * 10000);
-         newOpportunities.push({
-           pair: `${assetSymbol} / USDC`,
-           profit_usd: netProfit,
-           gross_profit_usd: grossProfit,
-           gas_cost_usd: gasCostUsd,
-           spread_bps: spreadBps,
-           chain_id: 137,
-           dex_a: pool1.dex,
-           dex_b: pool2.dex,
-           routeId: activeRouteId,
-           payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
-           executionReady: defiExecutor.isArmed(),
-         });
-       }
-
-       latestOpportunities = await publishOpportunitySnapshot(newOpportunities, "proactive-arb-sweep");
-       reservePoolsCount = livePoolAddresses.size;
+       const cfg = getRuntimeConfig();
+       const targetContract = cfg.C1_ARB_EXECUTOR_ADDRESS || cfg.C1_TARGET || cfg.ARB_CONTRACT_ADDRESS;
+       const result = await runDiscoveryCycle({
+         targetContract,
+         publish: true,
+         source: "api-proactive-full-graph",
+       });
+       const candidates = result.candidates;
+       const executableCandidates = candidates.filter((candidate) => candidate.c1ExecutionEligible || candidate.status === "EXECUTABLE_PROFIT_CANDIDATE");
+       const grossNonPositiveCount = candidates.filter((candidate: any) => {
+         if (typeof candidate.grossProfitRaw === "bigint") return candidate.grossProfitRaw <= 0n;
+         const grossProfitUsd = Number(candidate.grossProfitUsd ?? Number.NaN);
+         return Number.isFinite(grossProfitUsd) && grossProfitUsd <= 0;
+       }).length;
+       const postGasNonPositiveCount = candidates.filter((candidate: any) => {
+         if (candidate.status === "EXECUTABLE_PROFIT_CANDIDATE") return false;
+         const grossProfitUsd = Number(candidate.grossProfitUsd ?? Number.NaN);
+         const netProfitUsd = Number(candidate.netProfitUsd ?? Number.NaN);
+         return Number.isFinite(grossProfitUsd) && grossProfitUsd > 0 && (!Number.isFinite(netProfitUsd) || netProfitUsd <= 0);
+       }).length;
+       latestOpportunities = result.ledgerPayloads;
+       reservePoolsCount = result.stats.discoveredPools;
        reserveDirtyCount = 0;
-       reserveStaleCount = pools.length - livePoolAddresses.size;
+       reserveStaleCount = Math.max(0, result.stats.rejectedPreSend + result.stats.rejectedLowTvlEdge);
        reserveSyncEvents += 1;
        reserveSyncRate = reservePoolsCount;
        reserveLastUpdate = Date.now();
-       pipelineStages.find((stage) => stage.name === "DISCOVERY")!.count = newOpportunities.length;
+       pipelineStages.find((stage) => stage.name === "DISCOVERY")!.count = executableCandidates.length;
+       discoveryDiagnostics = {
+         routes_evaluated: result.stats.routeCyclesEnumerated,
+         reserve_failures: result.stats.rejectedPreSend,
+         gross_non_positive: grossNonPositiveCount,
+         post_gas_non_positive: postGasNonPositiveCount,
+         rejected_low_tvl_edges: result.stats.rejectedLowTvlEdge,
+         rejected_metadata: result.stats.rejectedMetadata,
+         rejected_quote: result.stats.routeCyclesRejectedQuote,
+         rejected_tvl_routes: result.stats.routeCyclesRejectedTvl,
+         rejected_presend: result.stats.rejectedPreSend,
+         source_counts: result.stats.sourceCounts,
+         route_cycles: result.stats.routeCyclesEnumerated,
+         route_truncated: result.stats.truncated,
+         gas_cost_usd: result.gasCostUsd,
+         min_profit_usd: result.minProfitUsd,
+         min_route_pool_tvl_usd: result.stats.minRoutePoolTvlUsd,
+         ready_pools: reservePoolsCount,
+         total_pools: result.stats.discoveredPools,
+         scanable_pairs: result.stats.discoveredEdges,
+         cached_spreads: latestOpportunities.length,
+         execution_disabled: isExecutionDisabled(),
+         last_scan_ms: Date.now() - startedAt,
+         updated_at: new Date().toISOString(),
+         summary: executableCandidates.length
+           ? "Full graph discovery found executable spread candidates."
+           : "Full graph discovery completed; no executable post-gate candidates.",
+       };
+       return {
+         ok: true,
+         ran: true,
+         diagnostics: discoveryDiagnostics,
+       };
      } catch(err: any) {
+       discoveryDiagnostics = {
+         ...discoveryDiagnostics,
+         error: err?.message || "unknown error",
+         last_scan_ms: Date.now() - startedAt,
+         updated_at: new Date().toISOString(),
+         summary: "Discovery sweep failed before producing a candidate snapshot.",
+       };
        systemLogQueue.push({ tag: "ERR", message: `Live arbitrage sweep failed: ${err?.message || "unknown error"}` });
+       return {
+         ok: false,
+         ran: true,
+         error: err?.message || "unknown error",
+         diagnostics: discoveryDiagnostics,
+       };
      } finally {
        isProactiveScannerRunning = false;
      }
   }
   setInterval(() => {
      proactiveArbSweep();
-  }, 3000);
+  }, Number(process.env.PROACTIVE_DISCOVERY_INTERVAL_MS || 30000));
 
   // API Routes
   app.get("/api/pools", async (req, res) => {
@@ -2591,21 +3448,50 @@ async function startServer() {
       const firstSide = reserveSideForTokens(tokens1, live1, DEFAULT_PROFIT_ASSET, POLYGON_WETH);
       const secondSide = reserveSideForTokens(tokens2, live2, POLYGON_WETH, DEFAULT_PROFIT_ASSET);
       const lowestPoolTvlRaw = [live1.reserve0 * 2n, live2.reserve0 * 2n].reduce((lowest, current) => current < lowest ? current : lowest);
-      const recommendedAmountRaw = lowestPoolTvlRaw * 15n / 100n;
-      const amountInUSDC = amount !== undefined && amount !== null
+      const maxFlashTvlFraction = envNumber("SIM_MAX_FLASH_TVL_FRACTION", 0.15);
+      const sizeFractions = parsePositiveNumberList(
+        process.env.FLASH_SIZE_SCAN_FRACTIONS,
+        [0.001, 0.0025, 0.005, 0.01, 0.02, 0.03, 0.05, 0.1, 0.15],
+      ).filter((fraction) => fraction <= maxFlashTvlFraction);
+      if (!sizeFractions.includes(maxFlashTvlFraction)) sizeFractions.push(maxFlashTvlFraction);
+      const explicitAmountRaw = amount !== undefined && amount !== null
         ? BigInt(Math.floor(Number(amount) * 10 ** 6))
-        : recommendedAmountRaw;
+        : undefined;
+      const searchAmounts = explicitAmountRaw
+        ? [explicitAmountRaw]
+        : sizeFractions.map((fraction) => lowestPoolTvlRaw * BigInt(Math.floor(fraction * 1_000_000)) / 1_000_000n);
+      const estimatedGasUsed = 300000;
+      const estimatedGasPriceGwei = gasGwei || await fetchGasGwei();
+      const gasCostUsd = ((estimatedGasUsed * estimatedGasPriceGwei) / 1e9) * (globalPrices["POL / MATIC"] || 0);
+      const pricedSizes = searchAmounts
+        .filter((candidateAmount) => candidateAmount > 0n)
+        .map((candidateAmount) => {
+          const candidateAssetBought = solveV2Swap(candidateAmount, firstSide.reserveIn, firstSide.reserveOut, 30);
+          const candidateUsdcOut = solveV2Swap(candidateAssetBought, secondSide.reserveIn, secondSide.reserveOut, 30);
+          const candidateInput = Number(formatRawTokenAmount(candidateAmount, 6));
+          const candidateGrossProfit = Number(formatRawTokenAmount(candidateUsdcOut - candidateAmount, 6));
+          return {
+            amountInRaw: candidateAmount,
+            assetBought: candidateAssetBought,
+            usdcOut: candidateUsdcOut,
+            inputAmount: candidateInput,
+            grossProfit: candidateGrossProfit,
+            netProfit: candidateGrossProfit - gasCostUsd,
+          };
+        })
+        .sort((left, right) => right.netProfit - left.netProfit);
+      const bestSize = pricedSizes[0];
+      if (!bestSize) throw new Error("NO_VALID_FLASH_SIZE_CANDIDATES");
+      const recommendedAmountRaw = searchAmounts[searchAmounts.length - 1] || bestSize.amountInRaw;
+      const amountInUSDC = bestSize.amountInRaw;
       const inputAmount = Number(formatRawTokenAmount(amountInUSDC, 6));
-      const assetBought = solveV2Swap(amountInUSDC, firstSide.reserveIn, firstSide.reserveOut, 30);
-      const usdcOut = solveV2Swap(assetBought, secondSide.reserveIn, secondSide.reserveOut, 30);
+      const assetBought = bestSize.assetBought;
+      const usdcOut = bestSize.usdcOut;
       const assetReceivedFloat = Number(assetBought) / 10 ** decimals;
       const usdcReceivedFloat = Number(usdcOut) / 10 ** 6;
       const buyLeg1Price = assetReceivedFloat > 0 ? inputAmount / assetReceivedFloat : 0;
       const sellLeg2Price = assetReceivedFloat > 0 ? usdcReceivedFloat / assetReceivedFloat : 0;
 
-      const estimatedGasUsed = 300000;
-      const estimatedGasPriceGwei = gasGwei || await fetchGasGwei();
-      const gasCostUsd = ((estimatedGasUsed * estimatedGasPriceGwei) / 1e9) * (globalPrices["POL / MATIC"] || 0);
       const grossProfit = usdcReceivedFloat - inputAmount;
       const netProfit = grossProfit - gasCostUsd;
       const grossProfitRaw = usdcOut - amountInUSDC;
@@ -2638,6 +3524,14 @@ async function startServer() {
           recommendedAmountRaw: recommendedAmountRaw.toString(),
           recommendedAmount: formatRawTokenAmount(recommendedAmountRaw, 6),
           explicitAmountUsed: amount !== undefined && amount !== null,
+          maxFlashTvlFraction,
+          sizeSearchCandidates: pricedSizes.map((candidate) => ({
+            amountInRaw: candidate.amountInRaw.toString(),
+            amountIn: candidate.inputAmount,
+            grossProfit: candidate.grossProfit,
+            netProfit: candidate.netProfit,
+          })),
+          selectedAmountRaw: amountInUSDC.toString(),
         },
         route: `${pool1.dex} (${pool1.token0}->${assetSymbol}) -> ${pool2.dex} (${assetSymbol}->${pool2.token0})`,
         payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
@@ -2749,6 +3643,11 @@ async function startServer() {
   });
 
   app.post("/api/liquidations/execute", async (req, res) => {
+    if (isExecutionDisabled()) {
+      setExecutionDryRun(true);
+      return res.status(423).json(executionDisabledPayload("FLASHLOAN_INTEGRATED_LIQUIDATIONS"));
+    }
+
     if (!getModuleStatus("MODULE_LIQUIDATION_ENABLED")) {
       return res.status(403).json({ success: false, message: "DISABLED_MODULE: Flashloan integrated liquidations are disabled in settings." });
     }
@@ -3254,13 +4153,3 @@ async function startServer() {
 startServer().catch((err) => {
   console.error("Failed to start server:", err);
 });
-
-
-
-
-
-
-
-
-
-

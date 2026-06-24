@@ -50,6 +50,34 @@ export type PoolEdge = {
   quoteAdapter: string;
   calldataAdapter: string;
   executorTarget: string;
+  extra?: {
+    v3Fee?: number;
+    curveIndexType?: "int128" | "uint256";
+    balancerWeightIn?: bigint;
+    balancerWeightOut?: bigint;
+    balancerSwapFeeBps?: bigint;
+  };
+};
+
+export type RouteQuoteCalldataInput = {
+  edge: PoolEdge;
+  amountIn: bigint;
+  amountOut: bigint;
+  minAmountOut: bigint;
+};
+
+export type RouteQuoteCalldataStep = RouteQuoteCalldataInput & {
+  calldata: string;
+};
+
+export type RouteExecutionStep = {
+  venue: string;
+  tokenIn: string;
+  tokenOut: string;
+  amountIn: bigint;
+  minAmountOut: bigint;
+  callValue: bigint;
+  payload: string;
 };
 
 export const ERC20_METADATA_ABI = [
@@ -472,6 +500,149 @@ export function buildStableSwapExchangeCalldata(params: {
   ]);
 }
 
+function assertPositiveAmount(value: bigint, label: string) {
+  if (typeof value !== "bigint" || value <= 0n) throw new Error(`${label}_MUST_BE_POSITIVE`);
+}
+
+function routeStepFee(edge: PoolEdge) {
+  const fee = edge.extra?.v3Fee ?? (edge.feeBps > 100 ? edge.feeBps : edge.feeBps * 100);
+  if (!Number.isInteger(fee) || fee <= 0 || fee > 1_000_000) throw new Error("V3_FEE_INVALID");
+  return fee;
+}
+
+function validateRouteQuoteInputs(params: {
+  steps: RouteQuoteCalldataInput[];
+  flashloanAsset: string;
+  expectedChainId?: 137;
+}) {
+  const expectedChainId = params.expectedChainId ?? 137;
+  if (!Array.isArray(params.steps) || params.steps.length === 0) throw new Error("ROUTE_STEPS_EMPTY");
+  if (!requiredAddressPresent(params.flashloanAsset)) throw new Error("FLASHLOAN_ASSET_ADDRESS_INVALID");
+  const flashloanAsset = ethers.getAddress(params.flashloanAsset);
+
+  for (let index = 0; index < params.steps.length; index += 1) {
+    const step = params.steps[index];
+    if (!step?.edge) throw new Error(`ROUTE_STEP_${index}_EDGE_MISSING`);
+    if (step.edge.chainId !== expectedChainId) throw new Error(`ROUTE_STEP_${index}_CHAIN_MISMATCH`);
+    if (!requiredAddressPresent(step.edge.tokenIn)) throw new Error(`ROUTE_STEP_${index}_TOKEN_IN_INVALID`);
+    if (!requiredAddressPresent(step.edge.tokenOut)) throw new Error(`ROUTE_STEP_${index}_TOKEN_OUT_INVALID`);
+    if (!requiredAddressPresent(step.edge.executorTarget)) throw new Error(`ROUTE_STEP_${index}_EXECUTOR_TARGET_INVALID`);
+    if (sameAddress(step.edge.tokenIn, step.edge.tokenOut)) throw new Error(`ROUTE_STEP_${index}_SELF_SWAP_REJECTED`);
+    assertPositiveAmount(step.amountIn, `ROUTE_STEP_${index}_AMOUNT_IN`);
+    assertPositiveAmount(step.amountOut, `ROUTE_STEP_${index}_AMOUNT_OUT`);
+    assertPositiveAmount(step.minAmountOut, `ROUTE_STEP_${index}_MIN_AMOUNT_OUT`);
+    if (step.minAmountOut > step.amountOut) throw new Error(`ROUTE_STEP_${index}_MIN_OUT_GT_QUOTE_OUT`);
+
+    if (index === 0 && !sameAddress(step.edge.tokenIn, flashloanAsset)) {
+      throw new Error("ROUTE_FLASHLOAN_ASSET_NOT_FIRST_INPUT");
+    }
+    if (index > 0) {
+      const previous = params.steps[index - 1];
+      if (!sameAddress(previous.edge.tokenOut, step.edge.tokenIn)) {
+        throw new Error(`ROUTE_STEP_${index}_TOKEN_CHAIN_BROKEN`);
+      }
+      if (step.amountIn !== previous.amountOut) {
+        throw new Error(`ROUTE_STEP_${index}_AMOUNT_CHAIN_BROKEN`);
+      }
+    }
+  }
+
+  const last = params.steps[params.steps.length - 1];
+  if (!sameAddress(last.edge.tokenOut, flashloanAsset)) throw new Error("ROUTE_FLASHLOAN_ASSET_NOT_FINAL_OUTPUT");
+}
+
+export function buildRouteCalldataFromQuote(params: {
+  steps: RouteQuoteCalldataInput[];
+  flashloanAsset: string;
+  receiver: string;
+  deadline: number;
+  expectedChainId?: 137;
+}): RouteQuoteCalldataStep[] {
+  if (!requiredAddressPresent(params.receiver)) throw new Error("ROUTE_RECEIVER_ADDRESS_INVALID");
+  if (!Number.isSafeInteger(params.deadline) || params.deadline <= 0) throw new Error("ROUTE_DEADLINE_INVALID");
+  validateRouteQuoteInputs(params);
+  const receiver = ethers.getAddress(params.receiver);
+
+  return params.steps.map((step, index) => {
+    const edge = step.edge;
+    let calldata: string;
+    if (edge.invariant === "V2_CPMM") {
+      calldata = buildV2SwapCalldata(step.amountIn, step.minAmountOut, [edge.tokenIn, edge.tokenOut], receiver, params.deadline);
+    } else if (edge.invariant === "V3_CONCENTRATED_LIQUIDITY") {
+      calldata = buildV3ExactInputSingleCalldata({
+        tokenIn: edge.tokenIn,
+        tokenOut: edge.tokenOut,
+        fee: routeStepFee(edge),
+        receiver,
+        deadline: params.deadline,
+        amountIn: step.amountIn,
+        minAmountOut: step.minAmountOut,
+      });
+    } else if (edge.invariant === "ALGEBRA_CONCENTRATED_LIQUIDITY") {
+      calldata = buildAlgebraExactInputSingleCalldata({
+        tokenIn: edge.tokenIn,
+        tokenOut: edge.tokenOut,
+        receiver,
+        deadline: params.deadline,
+        amountIn: step.amountIn,
+        minAmountOut: step.minAmountOut,
+      });
+    } else if (edge.invariant === "CURVE_STABLE_SWAP") {
+      if (edge.tokenInIndex === undefined || edge.tokenOutIndex === undefined) throw new Error(`ROUTE_STEP_${index}_CURVE_INDEX_MISSING`);
+      calldata = buildCurveRouterExchangeCalldata({
+        pool: edge.poolAddress,
+        tokenIn: edge.tokenIn,
+        tokenOut: edge.tokenOut,
+        amountIn: step.amountIn,
+        minAmountOut: step.minAmountOut,
+        receiver,
+      });
+    } else if (edge.invariant === "BALANCER_WEIGHTED") {
+      if (!edge.poolId) throw new Error(`ROUTE_STEP_${index}_BALANCER_POOL_ID_MISSING`);
+      calldata = buildBalancerSingleSwapCalldata({
+        poolId: edge.poolId,
+        tokenIn: edge.tokenIn,
+        tokenOut: edge.tokenOut,
+        amountIn: step.amountIn,
+        minAmountOut: step.minAmountOut,
+        sender: receiver,
+        receiver,
+        deadline: params.deadline,
+      });
+    } else if (edge.invariant === "STABLE_SWAP") {
+      if (edge.tokenInIndex === undefined || edge.tokenOutIndex === undefined) throw new Error(`ROUTE_STEP_${index}_STABLE_SWAP_INDEX_MISSING`);
+      calldata = buildStableSwapExchangeCalldata({
+        i: edge.tokenInIndex,
+        j: edge.tokenOutIndex,
+        amountIn: step.amountIn,
+        minAmountOut: step.minAmountOut,
+      });
+    } else {
+      throw new Error(`ROUTE_STEP_${index}_UNSUPPORTED_INVARIANT:${edge.invariant}`);
+    }
+    if (!/^0x[0-9a-fA-F]{8,}$/.test(calldata)) throw new Error(`ROUTE_STEP_${index}_CALLDATA_INVALID`);
+    return { ...step, calldata };
+  });
+}
+
+export function buildRouteExecutionStepsFromQuote(params: {
+  steps: RouteQuoteCalldataInput[];
+  flashloanAsset: string;
+  receiver: string;
+  deadline: number;
+  expectedChainId?: 137;
+}): RouteExecutionStep[] {
+  return buildRouteCalldataFromQuote(params).map((step) => ({
+    venue: ethers.getAddress(step.edge.executorTarget),
+    tokenIn: ethers.getAddress(step.edge.tokenIn),
+    tokenOut: ethers.getAddress(step.edge.tokenOut),
+    amountIn: step.amountIn,
+    minAmountOut: step.minAmountOut,
+    callValue: 0n,
+    payload: step.calldata,
+  }));
+}
+
 export async function simulateExactCalldataOnFork(params: {
   to: string;
   from: string;
@@ -519,7 +690,8 @@ async function revalidateV3Slot0Liquidity(provider: ethers.Provider, edge: PoolE
     pool.slot0(),
   ]);
   if (!containsBothTokens(token0, token1, edge)) return { ok: false, error: "V3_POOL_TOKEN_MISMATCH" };
-  if (Number(fee) !== edge.feeBps && edge.feeBps > 0) return { ok: false, error: "V3_FEE_MISMATCH" };
+  const expectedFee = edge.feeBps > 100 ? edge.feeBps : edge.feeBps * 100;
+  if (Number(fee) !== expectedFee && edge.feeBps > 0) return { ok: false, error: "V3_FEE_MISMATCH" };
   if (BigInt(liquidity) <= 0n) return { ok: false, error: "V3_ZERO_LIQUIDITY" };
   if (BigInt(slot0.sqrtPriceX96) <= 0n || slot0.unlocked === false) return { ok: false, error: "V3_INVALID_SLOT0" };
   return { ok: true };

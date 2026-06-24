@@ -1,0 +1,16 @@
+{
+  "payloadKind": "FLASHLOAN_INTEGRATED_LIQUIDATIONS",
+  "targetContract": "0x0000000000000000000000000000000000000000",
+  "liquidation": {
+    "collateralAsset": "0x0000000000000000000000000000000000000000",
+    "debtAsset": "0x0000000000000000000000000000000000000000",
+    "user": "0x0000000000000000000000000000000000000000",
+    "debtToCover": "1",
+    "minProfitBps": "1",
+    "swapProtocol": 0,
+    "swapFee": 0,
+    "minDebtAmountOut": "1",
+    "curvePool": "0x0000000000000000000000000000000000000000",
+    "maxSlippageBps": 100
+  }
+}

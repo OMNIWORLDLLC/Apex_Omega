@@ -1,0 +1,25 @@
+{
+  "payloadKind": "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
+  "targetContract": "0x0000000000000000000000000000000000000000",
+  "flashloanSource": 1,
+  "flashloanAsset": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+  "flashloanAmount": "1000000",
+  "context": {
+    "profitAsset": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+    "minNetProfit": "1",
+    "nonce": "0",
+    "merkleRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "proof": [],
+    "steps": [
+      {
+        "venue": "0x0000000000000000000000000000000000000000",
+        "tokenIn": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+        "tokenOut": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+        "amountIn": "1000000",
+        "minAmountOut": "1000001",
+        "callValue": "0",
+        "payload": "0x"
+      }
+    ]
+  }
+}

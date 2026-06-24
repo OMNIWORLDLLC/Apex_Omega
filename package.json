@@ -11,14 +11,17 @@
     "clean": "rm -rf dist",
     "lint": "node --max-old-space-size=4096 ./node_modules/typescript/bin/tsc --noEmit",
     "test:contract-sync": "tsx scripts/contract-sync-test.ts",
+    "test:gates": "tsx scripts/gate-invariant-test.ts",
     "test:signing-hash": "tsx scripts/signing-hash-test.ts",
     "test:broadcast": "tsx scripts/broadcast-test.ts",
+    "tx:one": "tsx scripts/tx-one.ts",
     "proof:strategy": "tsx scripts/strategy-proof-audit.ts",
     "routes:dynamic": "tsx scripts/dynamic-route-audit.ts",
     "routes:verify": "tsx scripts/route-engine-verify.ts",
     "fork:calldata": "tsx scripts/fork-calldata-sim.ts",
     "cloud:readiness": "tsx scripts/cloud-readiness.ts",
-    "live:cycle": "tsx scripts/live-cycle.ts"
+    "live:cycle": "tsx scripts/live-cycle.ts",
+    "live:pools": "tsx scripts/display-live-pools.ts"
   },
   "dependencies": {
     "@google/genai": "^1.52.0",
@@ -30,6 +33,7 @@
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "msgpackr": "^2.0.4",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "react-markdown": "^10.1.0",
