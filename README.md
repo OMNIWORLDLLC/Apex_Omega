@@ -291,7 +291,7 @@ All card and panel surfaces implement a three-layer frosted glass effect:
 
 | CSS Utility | Effect | Applied to |
 | --- | --- | --- |
-| `.glass-specular` | Subtle linear gradient from `rgba(255,255,255,0.042)` at 0 % to transparent at 28 % — simulates a glossy specular highlight along the top border of each component. | All card containers and major panels. |
+| `.glass-specular` | Subtle linear gradient from `rgba(255,255,255,0.042)` at 0% to transparent at 28% — simulates a glossy specular highlight along the top border of each component. | All card containers and major panels. |
 | `.glass-inset` | `box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), inset 0 0 32px rgba(0,0,0,0.38)` — top-lit inner rim highlight + deep inner darkness for panel depth. | Full-size component panels. |
 | `.glass-inset-sm` | Lighter inset variant (`rgba(255,255,255,0.055)`, `18px` spread) for compact stat cards and lane cells. | SystemIntel stat cards, LanesGrid cells, BenchmarkScorecard metric rows. |
 
