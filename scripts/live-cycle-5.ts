@@ -57,8 +57,7 @@ async function validateChain(): Promise<boolean> {
 
     const blockNumber = await provider.getBlockNumber();
     const feeData = await provider.getFeeData();
-    const gasPrice =
-      feeData.gasPrice ?? feeData.maxFeePerGas ?? feeData.maxPriorityFeePerGas;
+    const gasPrice = feeData.gasPrice ?? feeData.maxFeePerGas;
 
     if (gasPrice === null) {
       throw new Error("Unable to determine gas pricing from provider fee data");
