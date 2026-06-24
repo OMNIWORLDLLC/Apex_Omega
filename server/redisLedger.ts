@@ -182,7 +182,19 @@ export async function getActiveLedgerOpportunities(limit = 100) {
     const parsed = parseRedisJson(raw);
     if (parsed) rows.push(parsed);
   }
-  return rows;
+  return rows.sort((left, right) => {
+    const leftRank = Number(left.rank ?? Number.MAX_SAFE_INTEGER);
+    const rightRank = Number(right.rank ?? Number.MAX_SAFE_INTEGER);
+    if (leftRank !== rightRank) return leftRank - rightRank;
+    return Number(right.profit_usd ?? right.netProfitUsd ?? Number.NEGATIVE_INFINITY) -
+      Number(left.profit_usd ?? left.netProfitUsd ?? Number.NEGATIVE_INFINITY);
+  });
+}
+
+export async function getActiveLedgerCount() {
+  const client = await getRedisClient();
+  if (!client) return null;
+  return await client.zCard(activeSetKey());
 }
 
 export async function lockOpportunityForExecution(payload: LedgerPayload, ttlMs = EXECUTION_LOCK_TTL_MS) {

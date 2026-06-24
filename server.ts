@@ -8,6 +8,7 @@ import { WebSocketServer } from "ws";
 import { DeFiExecutorManager } from "./ExecutionManager.js";
 import { InvariantMath } from "./server/engine/invariants.js";
 import {
+  getActiveLedgerCount,
   getActiveLedgerOpportunities,
   getRedisLedgerStatus,
   lockOpportunityForExecution,
@@ -16,6 +17,9 @@ import {
 } from "./server/redisLedger.js";
 
 const CONFIG_PATH = path.join(process.cwd(), "config.json");
+const TOP_ROUTE_DISPLAY_LIMIT = Number(process.env.TOP_ROUTE_DISPLAY_LIMIT || 50);
+const C1_EXECUTABLE_LIMIT_PER_CYCLE = Number(process.env.C1_EXECUTABLE_LIMIT_PER_CYCLE || 10);
+const C2_DECISION_LIMIT_PER_CYCLE = Number(process.env.C2_DECISION_LIMIT_PER_CYCLE || 50);
 
 function readConfigFile(): Record<string, any> {
   if (!fs.existsSync(CONFIG_PATH)) return {};
@@ -865,7 +869,7 @@ async function startServer() {
   let latestOpportunities: any[] = [];
 
   const getActiveOpportunities = async () => {
-    const ledgerRows = await getActiveLedgerOpportunities().catch(() => null);
+    const ledgerRows = await getActiveLedgerOpportunities(TOP_ROUTE_DISPLAY_LIMIT).catch(() => null);
     return ledgerRows ?? latestOpportunities;
   };
 
@@ -1159,7 +1163,12 @@ async function startServer() {
     isC2ListenerRunning = true;
     try {
       lastC2ListenerBlock = currentBlock;
+      let c2DecisionsThisCycle = 0;
       for (const instance of c2Instances.values()) {
+        if (c2DecisionsThisCycle >= C2_DECISION_LIMIT_PER_CYCLE) {
+          systemLogQueue.push({ tag: "C2", message: `C2 LISTENER LIMIT: ${C2_DECISION_LIMIT_PER_CYCLE} block decisions reached for cycle block ${currentBlock}. Remaining pending instances deferred.` });
+          break;
+        }
         if (instance.status !== "PENDING") continue;
         if (currentBlock < instance.firstEligibleBlock) continue;
 
@@ -1178,6 +1187,7 @@ async function startServer() {
             },
           });
           if (added) {
+            c2DecisionsThisCycle += 1;
             bumpStage("C2_ACTION");
             systemLogQueue.push({ tag: "C2", message: `C2 LISTENER EXPIRED: C1 ${instance.c1HashLink}; current block ${currentBlock}; no tx hash created.` });
           }
@@ -1188,6 +1198,7 @@ async function startServer() {
         const decision = await evaluateC2DecisionForBlock(instance, currentBlock);
         const added = appendC2DecisionIfMissing(instance, currentBlock, decision);
         if (added) {
+          c2DecisionsThisCycle += 1;
           if (decision.txHash) {
             globalTxCounter++;
             totalSettledCycles++;
@@ -1455,6 +1466,7 @@ async function startServer() {
   });
 
   app.get("/api/execution/pipeline", (req, res) => {
+    const c2DecisionCount = [...c2Instances.values()].reduce((sum, instance) => sum + instance.decisions.length, 0);
     res.json({
       stages: pipelineStages.map((stage) => {
         if (stage.name === "ARCHIVE") return { ...stage, count: totalTrades };
@@ -1476,6 +1488,13 @@ async function startServer() {
           mode: "BLOCK_DRIVEN_PENDING_C1_WINDOW_ONLY",
           decisionOrder: ["MIRROR_SAME_CALLDATA_AGAINST_NEW_STATE", "REVERSE_REBUILT_CALLDATA_WITH_NEW_FLASHLOAN_SIZE", "DO_NOTHING"],
         },
+      },
+      routeLimits: {
+        topRouteDisplayLimit: TOP_ROUTE_DISPLAY_LIMIT,
+        c1ExecutableLimitPerCycle: C1_EXECUTABLE_LIMIT_PER_CYCLE,
+        c2DecisionLimitPerCycle: C2_DECISION_LIMIT_PER_CYCLE,
+        c2DecisionCount,
+        c2RequiresConfirmedC1: true,
       },
 
       // Reserve Cache data merged for easier consumption
@@ -1501,10 +1520,23 @@ async function startServer() {
   // Dual Spread Opportunity feeds
   app.get("/api/execution/opportunities", async (req, res) => {
     const activeOpportunities = await getActiveOpportunities();
+    const activeRouteCount = await getActiveLedgerCount().catch(() => null);
+    const c1ExecutableVisible = activeOpportunities.filter((item: any) => item.c1ExecutionEligible || item.executionReady).length;
+    const c2DecisionCount = [...c2Instances.values()].reduce((sum, instance) => sum + instance.decisions.length, 0);
     res.json({
       opportunities: activeOpportunities,
       source: "live",
       redisLedger: getRedisLedgerStatus(),
+      routeLimits: {
+        totalRoutesObserved: activeRouteCount ?? activeOpportunities.length,
+        topRouteDisplayLimit: TOP_ROUTE_DISPLAY_LIMIT,
+        visibleRoutes: activeOpportunities.length,
+        c1ExecutableVisible,
+        c1ExecutableLimitPerCycle: C1_EXECUTABLE_LIMIT_PER_CYCLE,
+        c2DecisionLimitPerCycle: C2_DECISION_LIMIT_PER_CYCLE,
+        c2DecisionCount,
+        c2RequiresConfirmedC1: true,
+      },
       diagnostics: {
         summary: activeOpportunities.length ? "Live arbitrage scanner found executable spread candidates." : "No live executable spreads observed.",
         profit_gate: { blocked_count: 0 },
@@ -1515,6 +1547,12 @@ async function startServer() {
           total_pools: pools.length,
           scanable_pairs: pools.length,
           cached_spreads: activeOpportunities.length,
+          total_routes_observed: activeRouteCount ?? activeOpportunities.length,
+          top_50_routes_visible: Math.min(activeOpportunities.length, TOP_ROUTE_DISPLAY_LIMIT),
+          c1_executable_visible: c1ExecutableVisible,
+          c1_executable_limit_per_cycle: C1_EXECUTABLE_LIMIT_PER_CYCLE,
+          c2_decision_limit_per_cycle: C2_DECISION_LIMIT_PER_CYCLE,
+          c2_decision_count: c2DecisionCount,
           summary: reservePoolsCount > 0 ? "Live reserves polled successfully" : "Awaiting live reserve sync",
         },
       },
@@ -1653,6 +1691,26 @@ async function startServer() {
         return res.status(400).json({
           success: false,
           error: "INVALID_C2_PAYLOAD: targetContract, c1InternalId, flashloanAsset, flashloanAmount, and context are required.",
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+        });
+      }
+
+      const pairedC1Instance = [...c2Instances.values()].find(
+        (instance) => instance.c1InternalId.toLowerCase() === String(c1InternalId).toLowerCase(),
+      );
+      if (!pairedC1Instance) {
+        return res.status(409).json({
+          success: false,
+          error: "NO_CONFIRMED_C1_INSTANCE_NO_C2",
+          rule: "C2 requires a confirmed C1 hash/internal id initialized by this service.",
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+        });
+      }
+      if (pairedC1Instance.status !== "PENDING") {
+        return res.status(409).json({
+          success: false,
+          error: `C2_INSTANCE_${pairedC1Instance.status}`,
+          c1Hash: pairedC1Instance.c1Hash,
           payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
         });
       }

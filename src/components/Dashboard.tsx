@@ -1193,7 +1193,7 @@ export default function Dashboard() {
 
       // Sourced Opportunities
       setOpportunities(oppRes.opportunities || []);
-      setOppDiagnostics(oppRes.diagnostics || null);
+      setOppDiagnostics({ ...(oppRes.diagnostics || {}), routeLimits: oppRes.routeLimits });
 
       // Lanes
       setLanes(laneRes || []);

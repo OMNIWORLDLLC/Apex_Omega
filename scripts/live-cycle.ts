@@ -38,6 +38,8 @@ const DEFAULT_DISCOVERY_CONCURRENCY = 16;
 const DEFAULT_QUOTE_LANES = 32;
 const DEFAULT_RPC_CALL_TIMEOUT_MS = 8_000;
 const DEFAULT_ROUTE_MAX_STATE_AGE_BLOCKS = 128;
+const DEFAULT_TOP_ROUTE_DISPLAY_LIMIT = 50;
+const DEFAULT_C1_EXECUTABLE_LIMIT = 10;
 const AAVE_V3_POOL = process.env.AAVE_V3_POOL_ADDRESS || "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
 const DEFAULT_C1_TARGET = process.env.C1_CONTRACT_ADDRESS || process.env.CONTRACT_ADDRESS || process.env.EXECUTOR_ADDRESS || "";
 const ZERO_ADDRESS = ethers.ZeroAddress;
@@ -164,6 +166,8 @@ type Candidate = {
   netProfitUsd?: number;
   lowestPoolTvlUsd: number;
   rejectionReason: string;
+  c1ExecutionEligible?: boolean;
+  c1ExecutionSlot?: number;
 };
 
 type DiscoveryStats = {
@@ -1391,11 +1395,20 @@ async function rankCandidates(provider: ethers.JsonRpcProvider, tokenCache: Map<
   });
 
   candidates.sort((a, b) => (b.netProfitUsd ?? Number.NEGATIVE_INFINITY) - (a.netProfitUsd ?? Number.NEGATIVE_INFINITY));
+  let executableSlot = 0;
   candidates.forEach((candidate, index) => {
     candidate.rank = index + 1;
     candidate.routeId = `LIVE-${String(index + 1).padStart(6, "0")}`;
+    if (candidate.status === "EXECUTABLE_PROFIT_CANDIDATE" && executableSlot < intEnv("C1_EXECUTABLE_LIMIT_PER_CYCLE", DEFAULT_C1_EXECUTABLE_LIMIT)) {
+      executableSlot += 1;
+      candidate.c1ExecutionEligible = true;
+      candidate.c1ExecutionSlot = executableSlot;
+    } else {
+      candidate.c1ExecutionEligible = false;
+    }
   });
-  await publishOpportunitySnapshot(candidates.map(candidateToLedgerPayload), "live-cycle-rank-candidates");
+  const topRouteDisplayLimit = intEnv("TOP_ROUTE_DISPLAY_LIMIT", DEFAULT_TOP_ROUTE_DISPLAY_LIMIT);
+  await publishOpportunitySnapshot(candidates.slice(0, topRouteDisplayLimit).map(candidateToLedgerPayload), "live-cycle-rank-candidates");
   return { candidates, gasCostUsd, minProfitUsd };
 }
 
@@ -1404,6 +1417,8 @@ function candidateToLedgerPayload(candidate: Candidate) {
     routeId: candidate.routeId,
     payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
     status: candidate.status,
+    c1ExecutionEligible: Boolean(candidate.c1ExecutionEligible),
+    c1ExecutionSlot: candidate.c1ExecutionSlot,
     pair: `${candidate.flashloanAsset.symbol} cycle`,
     path: routePath(candidate),
     venues: routeVenues(candidate),
@@ -1423,7 +1438,8 @@ function candidateToLedgerPayload(candidate: Candidate) {
     pools: candidate.steps.map((step) => step.edge.poolAddress),
     reason: candidate.rejectionReason,
     chain_id: 137,
-    executionReady: candidate.status === "EXECUTABLE_PROFIT_CANDIDATE",
+    executionReady: Boolean(candidate.c1ExecutionEligible),
+    c1ExecutableLimitPerCycle: intEnv("C1_EXECUTABLE_LIMIT_PER_CYCLE", DEFAULT_C1_EXECUTABLE_LIMIT),
   };
 }
 
@@ -1481,11 +1497,16 @@ async function main() {
   console.log(`FLASHLOAN_ASSETS|${flashloanAssets.map((asset) => `${asset.symbol}:${asset.address}`).join(",")}`);
   console.log(`PRICE_MAP|${JSON.stringify(Object.fromEntries(Array.from(tokenCache.values()).filter((token) => token.priceUsd).map((token) => [token.symbol, Number(token.priceUsd?.toFixed(8))])))}`);
 
-  for (const candidate of maxPrint === undefined ? candidates : candidates.slice(0, maxPrint)) {
+  const topRouteDisplayLimit = intEnv("TOP_ROUTE_DISPLAY_LIMIT", DEFAULT_TOP_ROUTE_DISPLAY_LIMIT);
+  console.log(`ROUTE_LIMITS|totalRoutes=${candidates.length}|topRouteDisplayLimit=${topRouteDisplayLimit}|c1ExecutableLimitPerCycle=${intEnv("C1_EXECUTABLE_LIMIT_PER_CYCLE", DEFAULT_C1_EXECUTABLE_LIMIT)}|c2DecisionLimitPerCycle=${Number(process.env.C2_DECISION_LIMIT_PER_CYCLE || 50)}`);
+
+  for (const candidate of maxPrint === undefined ? candidates.slice(0, topRouteDisplayLimit) : candidates.slice(0, Math.min(maxPrint, topRouteDisplayLimit))) {
     console.log([
       `ROUTE_RANK|rank=${candidate.rank}`,
       `routeId=${candidate.routeId}`,
       `status=${candidate.status}`,
+      `c1ExecutionEligible=${Boolean(candidate.c1ExecutionEligible)}`,
+      `c1ExecutionSlot=${candidate.c1ExecutionSlot ?? "NONE"}`,
       `flashloanAsset=${candidate.flashloanAsset.symbol}:${candidate.flashloanAsset.address}`,
       `flashloanProvider=${candidate.flashloanLiquidity.provider}`,
       `flashloanProviderAddress=${candidate.flashloanLiquidity.providerAddress}`,
@@ -1505,7 +1526,7 @@ async function main() {
     ].join("|"));
   }
 
-  const best = candidates[0];
+  const best = candidates.find((candidate) => candidate.c1ExecutionEligible) || candidates[0];
   if (!best) {
     console.log("OPPORTUNITY_DECISION|decision=DO_NOTHING|reason=NO_DYNAMIC_ROUTE_CANDIDATES|hash=NONE|pnlUpdated=false");
   } else if (best.status !== "EXECUTABLE_PROFIT_CANDIDATE") {
