@@ -1223,13 +1223,15 @@ async function quoteCandidate(
   // Build invariant-check inputs.  Gas and bribe costs are converted from USD
   // to flashloan-asset raw units so that the YIELD_INVARIANT can compare them
   // against on-chain amounts in the same denomination.
-  const assetPriceUsd = flashloanAsset.priceUsd ?? 0;
-  const gasCostInAssetRaw = assetPriceUsd > 0
-    ? floatToRaw(gasCostUsd / assetPriceUsd, flashloanAsset.decimals)
-    : 0n;
-  const bribesInAssetRaw = assetPriceUsd > 0
-    ? floatToRaw(bribesUsd / assetPriceUsd, flashloanAsset.decimals)
-    : 0n;
+  // Note: flashloanAsset.priceUsd is guaranteed > 0 by the ROUTE_TVL_OR_PRICE_UNRESOLVED
+  // guard above; the explicit check here prevents the fallback from silently masking
+  // unprofitable routes if this function is ever reached with missing price data.
+  const assetPriceUsd = flashloanAsset.priceUsd;
+  if (!assetPriceUsd || assetPriceUsd <= 0) {
+    throw new Error("FLASHLOAN_ASSET_PRICE_UNAVAILABLE: cannot convert gas/bribe costs to asset units");
+  }
+  const gasCostInAssetRaw = floatToRaw(gasCostUsd / assetPriceUsd, flashloanAsset.decimals);
+  const bribesInAssetRaw = floatToRaw(bribesUsd / assetPriceUsd, flashloanAsset.decimals);
 
   const invariantSteps: QuotedRouteStep[] = steps.map((s) => ({
     venueId: s.edge.edgeId,

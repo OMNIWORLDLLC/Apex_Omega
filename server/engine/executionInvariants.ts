@@ -250,9 +250,9 @@ export function enforceExecutionInvariants(
   costs: RouteCostsInAsset,
 ): void {
   if (!steps || steps.length < 2) {
-    throw new InvariantViolationError(
-      "YIELD_INVARIANT",
-      "route must contain at least 2 steps to form a valid arbitrage cycle",
+    // This is a precondition failure on the caller, not an invariant violation.
+    throw new Error(
+      "ROUTE_STRUCTURE_INVALID: route must contain at least 2 steps to form a valid arbitrage cycle",
     );
   }
   enforceVenueAgnostic(steps);
