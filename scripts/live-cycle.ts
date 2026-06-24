@@ -19,6 +19,7 @@ import {
   ROUTE_ADAPTER_TARGETS,
 } from "../server/engine/routeAdapters.js";
 import {
+  flushLaneEventBatch,
   lockOpportunityForExecution,
   publishOpportunitySnapshot,
   recordLaneEvent,
@@ -1678,6 +1679,7 @@ async function main() {
   console.log("C2_DECISION|decision=DO_NOTHING|reason=NO_CONFIRMED_C1_HASH_IN_THIS_CYCLE|hash=NONE|pnlUpdated=false");
   const pnl = await getJson("/api/dashboard/pnl-summary").catch((error) => ({ error: error.message }));
   console.log(`PNL_STATUS|sessionRaw=${pnl.sessionPnlRaw ?? "UNKNOWN"}|lifetimeRaw=${pnl.lifetimePnlRaw ?? "UNKNOWN"}|attribution=${pnl.pnlAttribution ?? "UNKNOWN"}|pnlUpdated=false`);
+  await flushLaneEventBatch("cycle_end");
   console.log("LIVE_CYCLE_END|status=COMPLETE|broadcasted=false_unless_hash_printed_above");
 }
 
