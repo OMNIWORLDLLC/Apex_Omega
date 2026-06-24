@@ -10,6 +10,7 @@ import { InvariantMath } from "./server/engine/invariants.js";
 import {
   getActiveLedgerOpportunities,
   getRedisLedgerStatus,
+  lockOpportunityForExecution,
   publishOpportunitySnapshot,
   releaseOpportunityLock,
 } from "./server/redisLedger.js";
@@ -907,6 +908,206 @@ async function startServer() {
     return true;
   };
 
+  const c2MirrorEnabled = process.env.C2_AUTO_MIRROR_ENABLED !== "false";
+  const c2ReverseEnabled = process.env.C2_AUTO_REVERSE_ENABLED !== "false";
+
+  const buildReverseC2PayloadFromSeed = (instance: C2Instance) => {
+    const routeMetadata = instance.seed.context?.routeMetadata || instance.seed.context?.reverseRouteMetadata;
+    if (!routeMetadata?.reverseContext || !routeMetadata?.reverseFlashloanAmount) {
+      return {
+        ok: false as const,
+        error: "REVERSE_ROUTE_METADATA_MISSING: raw preceding calldata is not enough to safely invert route calldata or compute new flashloan size.",
+      };
+    }
+    return {
+      ok: true as const,
+      flashloanSource: Number(routeMetadata.reverseFlashloanSource ?? instance.seed.flashloanSource),
+      flashloanAsset: routeMetadata.reverseFlashloanAsset || instance.seed.flashloanAsset,
+      flashloanAmount: String(routeMetadata.reverseFlashloanAmount),
+      context: routeMetadata.reverseContext,
+    };
+  };
+
+  const evaluateC2DecisionForBlock = async (instance: C2Instance, currentBlock: number): Promise<C2DecisionRecord> => {
+    const cfg = getRuntimeConfig();
+    const targetContract = instance.seed.targetContract || cfg.C2_ARB_EXECUTOR_ADDRESS || cfg.C2_TARGET || cfg.C1_ARB_EXECUTOR_ADDRESS || cfg.C1_TARGET || cfg.ARB_CONTRACT_ADDRESS;
+    const baseRecord = {
+      blockNumber: currentBlock,
+      createdAt: Date.now(),
+    };
+
+    const lockPayload = {
+      routeId: `C2:${instance.c1Hash}:${currentBlock}`,
+      payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+      c1Hash: instance.c1Hash,
+      c1InternalId: instance.c1InternalId,
+      blockNumber: currentBlock,
+      targetContract,
+    };
+    const lock = await lockOpportunityForExecution(lockPayload, Number(process.env.REDIS_C2_DECISION_LOCK_TTL_MS || 20_000));
+    if (!lock.ok) {
+      return {
+        ...baseRecord,
+        decision: "DO_NOTHING",
+        routeEvaluation: {
+          listener: "C2_BLOCK_LISTENER",
+          gate: "C2_DECISION_LOCK_BLOCKED",
+          reason: lock.reason,
+          redisId: lock.id,
+          txCreated: false,
+        },
+      };
+    }
+
+    try {
+      if (c2MirrorEnabled && targetContract && instance.seed.context) {
+        const mirrorResult = await defiExecutor.broadcastFlashloanIntegratedC2Payload(
+          targetContract,
+          instance.c1InternalId,
+          Number(instance.seed.flashloanSource ?? DEFAULT_FLASHLOAN_SOURCE_AAVE_V3),
+          instance.seed.flashloanAsset,
+          instance.seed.flashloanAmount,
+          instance.seed.context,
+        );
+
+        if (mirrorResult.success && mirrorResult.hash) {
+          await releaseOpportunityLock(lock.id, "C2_MIRROR_PENDING", {
+            txHash: mirrorResult.hash,
+            txHashLink: mirrorResult.hashLink || getExplorerTxLink(mirrorResult.hash),
+            blockNumber: currentBlock,
+          });
+          return {
+            ...baseRecord,
+            decision: "MIRROR",
+            txHash: mirrorResult.hash,
+            txHashLink: mirrorResult.hashLink || getExplorerTxLink(mirrorResult.hash),
+            result: mirrorResult,
+            routeEvaluation: {
+              listener: "C2_BLOCK_LISTENER",
+              gate: "MIRROR_FORK_SIM_AND_PROFIT_GATES_PASSED",
+              reusedPrecedingPayloadContext: true,
+              txCreated: true,
+            },
+          };
+        }
+
+        if (c2ReverseEnabled) {
+          const reversePayload = buildReverseC2PayloadFromSeed(instance);
+          if (reversePayload.ok) {
+            const reverseResult = await defiExecutor.broadcastFlashloanIntegratedC2Payload(
+              targetContract,
+              instance.c1InternalId,
+              reversePayload.flashloanSource,
+              reversePayload.flashloanAsset,
+              reversePayload.flashloanAmount,
+              reversePayload.context,
+            );
+            if (reverseResult.success && reverseResult.hash) {
+              await releaseOpportunityLock(lock.id, "C2_REVERSE_PENDING", {
+                txHash: reverseResult.hash,
+                txHashLink: reverseResult.hashLink || getExplorerTxLink(reverseResult.hash),
+                blockNumber: currentBlock,
+              });
+              return {
+                ...baseRecord,
+                decision: "REVERSE",
+                txHash: reverseResult.hash,
+                txHashLink: reverseResult.hashLink || getExplorerTxLink(reverseResult.hash),
+                result: reverseResult,
+                routeEvaluation: {
+                  listener: "C2_BLOCK_LISTENER",
+                  gate: "REVERSE_FORK_SIM_AND_PROFIT_GATES_PASSED",
+                  newFlashloanSize: reversePayload.flashloanAmount,
+                  txCreated: true,
+                },
+              };
+            }
+            await releaseOpportunityLock(lock.id, "C2_NO_OP", {
+              mirrorError: mirrorResult.error,
+              reverseError: reverseResult.error,
+              blockNumber: currentBlock,
+            });
+            return {
+              ...baseRecord,
+              decision: "DO_NOTHING",
+              result: reverseResult,
+              routeEvaluation: {
+                listener: "C2_BLOCK_LISTENER",
+                gate: "MIRROR_AND_REVERSE_FAILED_GATES",
+                mirrorError: mirrorResult.error,
+                reverseError: reverseResult.error,
+                txCreated: false,
+              },
+            };
+          }
+
+          await releaseOpportunityLock(lock.id, "C2_NO_OP", {
+            mirrorError: mirrorResult.error,
+            reverseError: reversePayload.error,
+            blockNumber: currentBlock,
+          });
+          return {
+            ...baseRecord,
+            decision: "DO_NOTHING",
+            result: mirrorResult,
+            routeEvaluation: {
+              listener: "C2_BLOCK_LISTENER",
+              gate: "MIRROR_FAILED_REVERSE_UNAVAILABLE",
+              mirrorError: mirrorResult.error,
+              reverseError: reversePayload.error,
+              txCreated: false,
+            },
+          };
+        }
+
+        await releaseOpportunityLock(lock.id, "C2_NO_OP", {
+          mirrorError: mirrorResult.error,
+          blockNumber: currentBlock,
+        });
+        return {
+          ...baseRecord,
+          decision: "DO_NOTHING",
+          result: mirrorResult,
+          routeEvaluation: {
+            listener: "C2_BLOCK_LISTENER",
+            gate: "MIRROR_FAILED_REVERSE_DISABLED",
+            mirrorError: mirrorResult.error,
+            txCreated: false,
+          },
+        };
+      }
+
+      await releaseOpportunityLock(lock.id, "C2_NO_OP", {
+        error: "C2_MIRROR_DISABLED_OR_SEED_CONTEXT_MISSING",
+        blockNumber: currentBlock,
+      });
+      return {
+        ...baseRecord,
+        decision: "DO_NOTHING",
+        routeEvaluation: {
+          listener: "C2_BLOCK_LISTENER",
+          gate: "C2_MIRROR_DISABLED_OR_SEED_CONTEXT_MISSING",
+          txCreated: false,
+        },
+      };
+    } catch (error: any) {
+      await releaseOpportunityLock(lock.id, "C2_NO_OP", {
+        error: error?.message || "C2 decision evaluation failed",
+        blockNumber: currentBlock,
+      });
+      return {
+        ...baseRecord,
+        decision: "DO_NOTHING",
+        routeEvaluation: {
+          listener: "C2_BLOCK_LISTENER",
+          gate: "C2_DECISION_EXCEPTION",
+          error: error?.message || "C2 decision evaluation failed",
+          txCreated: false,
+        },
+      };
+    }
+  };
+
   const initializeC2InstanceFromC1 = async (hash: string, receipt: any, pending: any) => {
     if (pending.payloadKind !== "FLASHLOAN_INTEGRATED_C1_PAYLOADS") return null;
     if (!pending.c2Seed?.context) return null;
@@ -984,24 +1185,38 @@ async function startServer() {
         }
 
         bumpStage("C2_RECOMPUTE_FROM_PAIRED_C1");
-        const added = appendC2DecisionIfMissing(instance, currentBlock, {
-          blockNumber: currentBlock,
-          decision: "DO_NOTHING",
-          createdAt: Date.now(),
-          routeEvaluation: {
-            listener: "C2_BLOCK_LISTENER",
-            gate: "NO_EXECUTABLE_MIRROR_OR_REVERSE_SIGNAL",
-            reason: "C2 listener is block-driven and will not fabricate a mirror/reverse payload without explicit executable route revalidation.",
-            txCreated: false,
-          },
-        });
+        const decision = await evaluateC2DecisionForBlock(instance, currentBlock);
+        const added = appendC2DecisionIfMissing(instance, currentBlock, decision);
         if (added) {
+          if (decision.txHash) {
+            globalTxCounter++;
+            totalSettledCycles++;
+            bumpStage("C2_EXECUTION");
+            const profitReceiver = getConfiguredProfitReceiver();
+            const profitAsset = getConfiguredProfitAsset();
+            pendingSettlements.set(decision.txHash.toLowerCase(), {
+              payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+              hash: decision.txHash,
+              hashLink: decision.txHashLink || getExplorerTxLink(decision.txHash),
+              profitReceiver,
+              receiverLink: getExplorerAddressLink(profitReceiver),
+              profitAsset,
+              preBalance: await fetchTokenBalance(profitAsset, profitReceiver),
+              submittedAt: Date.now(),
+              verified: false,
+            });
+            instance.finalDecision = decision.decision === "MIRROR" || decision.decision === "REVERSE" ? decision.decision : instance.finalDecision;
+            instance.c2Hash = decision.txHash;
+            instance.c2HashLink = decision.txHashLink || getExplorerTxLink(decision.txHash);
+            systemLogQueue.push({ tag: "C2", message: `C2 LISTENER ${decision.decision}: HASH PRINTED ${decision.txHashLink || getExplorerTxLink(decision.txHash)} for C1 ${instance.c1HashLink}; P&L locked pending on-chain verification.` });
+          } else {
+            systemLogQueue.push({ tag: "C2", message: `C2 LISTENER ${decision.decision}: C1 ${instance.c1HashLink} evaluated at block ${currentBlock}; no tx hash created.` });
+          }
           if (currentBlock >= instance.expiresAfterBlock) {
             instance.status = "EXPIRED";
-            instance.finalDecision = "EXPIRED";
+            instance.finalDecision = instance.finalDecision || "EXPIRED";
           }
           bumpStage("C2_ACTION");
-          systemLogQueue.push({ tag: "C2", message: `C2 LISTENER DO_NOTHING: C1 ${instance.c1HashLink} evaluated at block ${currentBlock}; no tx hash created.` });
         }
       }
     } finally {
@@ -1255,8 +1470,11 @@ async function startServer() {
         hashRule: "ONLY_MIRROR_OR_REVERSE_CAN_CREATE_C2_HASH",
         listener: {
           enabled: c2ListenerEnabled,
+          mirrorEnabled: c2MirrorEnabled,
+          reverseEnabled: c2ReverseEnabled,
           lastBlock: lastC2ListenerBlock,
           mode: "BLOCK_DRIVEN_PENDING_C1_WINDOW_ONLY",
+          decisionOrder: ["MIRROR_SAME_CALLDATA_AGAINST_NEW_STATE", "REVERSE_REBUILT_CALLDATA_WITH_NEW_FLASHLOAN_SIZE", "DO_NOTHING"],
         },
       },
 
