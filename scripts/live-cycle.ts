@@ -308,7 +308,7 @@ async function postJson(path: string, body: unknown) {
   const response = await fetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body, (_key, value) => typeof value === "bigint" ? value.toString() : value),
   });
   return { status: response.status, json: await response.json() };
 }
