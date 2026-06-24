@@ -56,7 +56,13 @@ async function validateChain(): Promise<boolean> {
     }
 
     const blockNumber = await provider.getBlockNumber();
-    const gasPrice = await provider.getFeeData().then((fee) => fee.gasPrice || 0n);
+    const feeData = await provider.getFeeData();
+    const gasPrice =
+      feeData.gasPrice ?? feeData.maxFeePerGas ?? feeData.maxPriorityFeePerGas;
+
+    if (gasPrice === null) {
+      throw new Error("Unable to determine gas pricing from provider fee data");
+    }
 
     console.log(`✓ Chain 137 verified`);
     console.log(`  Block: ${blockNumber}`);

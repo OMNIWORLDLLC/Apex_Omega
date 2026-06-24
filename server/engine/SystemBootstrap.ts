@@ -51,7 +51,7 @@ export function formatCycleResults(results: CycleResults): string {
   return lines.join("\n");
 }
 
-export default class ApexOmegaBootstrap {
+export default class SystemBootstrap {
   private readonly discoveryEngine: MevRouteDiscoveryEngine;
 
   constructor(
