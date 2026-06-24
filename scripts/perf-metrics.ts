@@ -577,11 +577,11 @@ const SNAPSHOT_TVL_FRACTION = 0.001;         // conservative 0.1% of lowest-pool
 // Token metadata (real Polygon mainnet contracts)
 const SNAP_TOKENS: Record<string, TokenMeta> = {
   USDC:  { address: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", symbol: "USDC",  decimals: 6,  priceUsd: 1.00 },
-  WETH:  { address: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", symbol: "WETH",  decimals: 18, priceUsd: 3820.00 }, // representative price at snapshot block 89063000
+  WETH:  { address: "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619", symbol: "WETH",  decimals: 18, priceUsd: 3820.00 }, // historical price at snapshot block 89063000
   WMATIC:{ address: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270", symbol: "WMATIC",decimals: 18, priceUsd: 0.45 },
   USDT:  { address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", symbol: "USDT",  decimals: 6,  priceUsd: 1.00 },
   DAI:   { address: "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", symbol: "DAI",   decimals: 18, priceUsd: 1.00 },
-  WBTC:  { address: "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", symbol: "WBTC",  decimals: 8,  priceUsd: 105_000.00 }, // representative price at snapshot block 89063000
+  WBTC:  { address: "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6", symbol: "WBTC",  decimals: 8,  priceUsd: 105_000.00 }, // historical price at snapshot block 89063000
 };
 
 function buildSnapshotData(): { edges: PoolEdge[]; flashProviders: FlashProvider[] } {
@@ -662,7 +662,7 @@ function buildSnapshotData(): { edges: PoolEdge[]; flashProviders: FlashProvider
 
   // ── SushiSwap V2 pairs  (factory 0xc35D…, router 0x1b02…) ─────────────────
   // Note: SS prices intentionally differ from QS — this creates the arbitrage spread.
-  // QS ETH=$3820.46, SS ETH=$3875.22 → 1.43% spread (representative of historical volatility/liquidity imbalance).
+  // QS ETH=$3820.46, SS ETH=$3875.22 → 1.43% spread (historical volatility/liquidity imbalance at block 89063000).
   // Actual net profit varies with trade size, gas, and market depth; these values are historical, not forward-looking.
 
   // SS USDC/WETH  0x152A9dE2fe747f3612F89003c3FdFF51c9202Eee
