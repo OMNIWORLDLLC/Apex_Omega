@@ -297,9 +297,11 @@ export class MevRouteDiscoveryEngine {
   }
 
   /**
-   * Compute a complete triangular arbitrage route: tokenA -> tokenB -> tokenA
-   * @param pair - starting token pair
-   * @param minProfitUSD - minimum profit threshold
+   * Compute a complete triangular arbitrage route.
+   * Both swap directions are evaluated for every venue pair:
+   *   - Direction AB: tokenIn → tokenOut (Leg 1), tokenOut → tokenIn (Leg 2)
+   *   - Direction BA: tokenOut → tokenIn (Leg 1), tokenIn → tokenOut (Leg 2)
+   * Only routes that satisfy the PRICE INVARIANT and YIELD INVARIANT are kept.
    */
   private async computeTriangularArbitrageRoute(
     pair: TokenPair,
@@ -309,11 +311,13 @@ export class MevRouteDiscoveryEngine {
 
     // Standard input size (15,000 USDC.e equivalent, scaled by token decimals)
     const standardInputUsd = 15000;
-    const inputAmount = BigInt(
+    const inputAmountAB = BigInt(
       Math.floor(standardInputUsd * 10 ** pair.tokenInDecimals)
     );
+    const inputAmountBA = BigInt(
+      Math.floor(standardInputUsd * 10 ** pair.tokenOutDecimals)
+    );
 
-    // Find best 2-leg path
     const venues = Object.entries(this.dexVenues).filter(([, v]) => v.enabled);
 
     let bestRoute: ArbitrageRoute | null = null;
@@ -323,52 +327,72 @@ export class MevRouteDiscoveryEngine {
         const [venueId1] = venues[legIdx1];
         const [venueId2] = venues[legIdx2];
 
+        // ---- Direction AB: tokenIn → tokenOut → tokenIn ----
         try {
-          // Mock pricing (in production, would call actual DEX contracts)
-          const leg1Price = this.estimateSwapPrice(
+          const leg1AB = this.estimateSwapPrice(
             pair.tokenIn,
             pair.tokenOut,
-            inputAmount,
+            inputAmountAB,
             venueId1
           );
-          const leg2Price = this.estimateSwapPrice(
+          const leg2AB = this.estimateSwapPrice(
             pair.tokenOut,
             pair.tokenIn,
-            leg1Price.expectedAmountOut,
+            leg1AB.expectedAmountOut,
             venueId2
           );
-
-          const route = this.assembleRoute(
+          const routeAB = this.assembleRoute(
             pair,
             [
-              this.createSwapLeg(
-                venueId1,
-                pair.tokenIn,
-                pair.tokenOut,
-                inputAmount,
-                leg1Price
-              ),
-              this.createSwapLeg(
-                venueId2,
-                pair.tokenOut,
-                pair.tokenIn,
-                leg1Price.expectedAmountOut,
-                leg2Price
-              ),
+              this.createSwapLeg(venueId1, pair.tokenIn, pair.tokenOut, inputAmountAB, leg1AB),
+              this.createSwapLeg(venueId2, pair.tokenOut, pair.tokenIn, leg1AB.expectedAmountOut, leg2AB),
             ],
             standardInputUsd,
             minProfitUSD
           );
-
-          if (
-            route.isExecutable &&
-            (!bestRoute || route.netProfitUSD > bestRoute.netProfitUSD)
-          ) {
-            bestRoute = route;
+          if (routeAB.isExecutable && (!bestRoute || routeAB.netProfitUSD > bestRoute.netProfitUSD)) {
+            bestRoute = routeAB;
           }
         } catch {
           // Continue on pricing errors
-          continue;
+        }
+
+        // ---- Direction BA: tokenOut → tokenIn → tokenOut ----
+        try {
+          const reversePair: TokenPair = {
+            tokenIn: pair.tokenOut,
+            tokenOut: pair.tokenIn,
+            tokenInSymbol: pair.tokenOutSymbol,
+            tokenOutSymbol: pair.tokenInSymbol,
+            tokenInDecimals: pair.tokenOutDecimals,
+            tokenOutDecimals: pair.tokenInDecimals,
+          };
+          const leg1BA = this.estimateSwapPrice(
+            pair.tokenOut,
+            pair.tokenIn,
+            inputAmountBA,
+            venueId1
+          );
+          const leg2BA = this.estimateSwapPrice(
+            pair.tokenIn,
+            pair.tokenOut,
+            leg1BA.expectedAmountOut,
+            venueId2
+          );
+          const routeBA = this.assembleRoute(
+            reversePair,
+            [
+              this.createSwapLeg(venueId1, pair.tokenOut, pair.tokenIn, inputAmountBA, leg1BA),
+              this.createSwapLeg(venueId2, pair.tokenIn, pair.tokenOut, leg1BA.expectedAmountOut, leg2BA),
+            ],
+            standardInputUsd,
+            minProfitUSD
+          );
+          if (routeBA.isExecutable && (!bestRoute || routeBA.netProfitUSD > bestRoute.netProfitUSD)) {
+            bestRoute = routeBA;
+          }
+        } catch {
+          // Continue on pricing errors
         }
       }
     }
@@ -430,7 +454,18 @@ export class MevRouteDiscoveryEngine {
   }
 
   /**
-   * Assemble complete route with financial analysis
+   * Assemble complete route with financial analysis.
+   * Enforces PRICE INVARIANT and YIELD INVARIANT before marking a route executable.
+   *
+   * PRICE INVARIANT: effective Ask price for Leg 1 (Acquisition) must be strictly
+   *   below the effective Bid price for Leg 2 (Distribution).
+   *   buyPrice  = inputAmount  / buyOut   (cost per intermediate token)
+   *   sellPrice = finalOutput  / buyOut   (revenue per intermediate token)
+   *   Required: buyPrice < sellPrice  ⟺  inputAmount < finalOutput
+   *
+   * YIELD INVARIANT: Total Output (Leg 2) > Total Input (Leg 1) +
+   *   (Flashloan Fees + Swap Fees + Gas Costs + Bribes).
+   *   netProfitUSD must be strictly positive and ≥ minProfitUSD after all costs.
    */
   private assembleRoute(
     pair: TokenPair,
@@ -440,7 +475,7 @@ export class MevRouteDiscoveryEngine {
   ): ArbitrageRoute {
     const context = this.context!;
 
-    // Sum all fees
+    // Sum all swap fees
     let totalSwapFeesRaw = 0n;
     for (const leg of legs) {
       totalSwapFeesRaw += BigInt(
@@ -454,31 +489,56 @@ export class MevRouteDiscoveryEngine {
     );
     const totalFeesRaw = totalSwapFeesRaw + flashloanFeeRaw;
 
+    const inputAmount = legs[0].amountIn;
     const finalOutput = legs[legs.length - 1].expectedAmountOut;
-    const grossProfitRaw = finalOutput > legs[0].amountIn
-      ? finalOutput - legs[0].amountIn
+
+    // PRICE INVARIANT: effective Ask (Leg 1) must be strictly below effective Bid (Leg 2).
+    // For a circular route (start/end same token):
+    //   buyPrice  = inputAmount / buyOut  (Leg 1 ask)
+    //   sellPrice = finalOutput / buyOut  (Leg 2 bid)
+    //   Required: inputAmount < finalOutput
+    const priceInvariantSatisfied = finalOutput > inputAmount;
+
+    const grossProfitRaw = priceInvariantSatisfied
+      ? finalOutput - inputAmount
       : 0n;
 
-    // Gas calculation
+    // Gas calculation (gas cost is paid in native MATIC, kept separate from token-denominated fees)
     const estimatedGasUsed = 350000; // Typical for complex arb + flashloan
     const gasCostWei = BigInt(estimatedGasUsed) * context.gasPrice;
-    const gasCostUSD =
-      Number(gasCostWei) / 1e18 * context.maticPriceUSD;
+    const gasCostUSD = Number(gasCostWei) / 1e18 * context.maticPriceUSD;
 
     const grossProfit = Number(grossProfitRaw) / 10 ** pair.tokenInDecimals;
     const totalFees = Number(totalFeesRaw) / 10 ** pair.tokenInDecimals;
+
+    // YIELD INVARIANT (token-denominated component): output must cover input + swap fees + flashloan fee
     const netProfitRaw = grossProfitRaw > totalFeesRaw
       ? grossProfitRaw - totalFeesRaw
       : 0n;
     const netProfit = Number(netProfitRaw) / 10 ** pair.tokenInDecimals;
-    const netProfitUSD = netProfit * context.maticPriceUSD; // Simplified conversion
+
+    // YIELD INVARIANT (full, including gas): net profit in USD must exceed gas cost.
+    // netProfitUSD subtracts gasCostUSD so that only routes with strictly positive
+    // profit after ALL costs (swap fees + flashloan fee + gas) are marked executable.
+    const netProfitUSD = Math.max(0, netProfit * context.maticPriceUSD - gasCostUSD);
+
+    let executabilityReason: string | undefined;
+    if (!priceInvariantSatisfied) {
+      executabilityReason = "PRICE_INVARIANT_VIOLATED: finalOutput <= inputAmount (Ask >= Bid)";
+    } else if (netProfitRaw === 0n) {
+      executabilityReason = "YIELD_INVARIANT_VIOLATED: gross profit does not cover swap and flashloan fees";
+    } else if (netProfitUSD < minProfitUSD) {
+      executabilityReason = `YIELD_INVARIANT_VIOLATED: net profit ${netProfitUSD.toFixed(4)} USD (after gas) below minimum ${minProfitUSD} USD`;
+    }
+
+    const isExecutable = priceInvariantSatisfied && netProfitRaw > 0n && netProfitUSD >= minProfitUSD;
 
     return {
       routeId: `ROUTE-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
       tokenIn: pair.tokenIn,
       tokenOut: pair.tokenOut,
       legs,
-      inputAmount: legs[0].amountIn,
+      inputAmount,
       expectedFinalOutput: finalOutput,
       grossProfitRaw,
       grossProfit,
@@ -493,11 +553,8 @@ export class MevRouteDiscoveryEngine {
       netProfitRaw,
       netProfit,
       netProfitUSD,
-      isExecutable: netProfitUSD >= minProfitUSD,
-      executabilityReason:
-        netProfitUSD < minProfitUSD
-          ? `Profit ${netProfitUSD.toFixed(2)} USD below minimum ${minProfitUSD} USD`
-          : undefined,
+      isExecutable,
+      executabilityReason,
     };
   }
 
