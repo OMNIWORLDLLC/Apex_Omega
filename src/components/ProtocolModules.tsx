@@ -66,7 +66,7 @@ export default function ProtocolModules() {
     <section className="bg-[#050505] rounded-lg border border-[#1e2025] flex flex-col min-h-0 flex-1 min-w-[300px] glass-specular glass-inset">
       <div className="flex px-4 py-2 border-b border-[#1e2025]/60 justify-between items-center bg-[#07090b]">
         <span className="text-[10px] font-mono text-gray-500 font-bold tracking-[0.2em]">PROTOCOL MODULES</span>
-        {saving && <span className="text-[9px] text-cyan-500 animate-pulse uppercase tracking-widest">Sycing with Engine...</span>}
+        {saving && <span className="text-[9px] text-cyan-500 animate-pulse uppercase tracking-widest">Syncing with Engine...</span>}
       </div>
       <div className="p-4 flex-1 overflow-y-auto grid grid-cols-1 md:grid-cols-2 gap-4">
         {modules.map((m) => {
