@@ -18,7 +18,8 @@
     "routes:verify": "tsx scripts/route-engine-verify.ts",
     "fork:calldata": "tsx scripts/fork-calldata-sim.ts",
     "cloud:readiness": "tsx scripts/cloud-readiness.ts",
-    "live:cycle": "tsx scripts/live-cycle.ts"
+    "live:cycle": "tsx scripts/live-cycle.ts",
+    "live:cycle-5": "tsx scripts/live-cycle-5.ts"
   },
   "dependencies": {
     "@google/genai": "^1.52.0",
