@@ -84,7 +84,7 @@ export default function NotificationSidebar() {
 
   return (
     <>
-      <div className="fixed left-0 right-0 bottom-0 h-[220px] bg-[#07080a]/95 backdrop-blur-sm border-t border-[#1e2025] shadow-2xl z-50 flex flex-col transform transition-transform duration-300">
+      <div className="fixed left-0 right-0 bottom-0 h-[220px] bg-[#07080a]/95 backdrop-blur-sm border-t border-[#1e2025] shadow-[inset_0_1px_0_rgba(255,255,255,0.07),inset_0_0_32px_rgba(0,0,0,0.38),0_-4px_32px_rgba(0,0,0,0.6)] glass-specular z-50 flex flex-col transform transition-transform duration-300">
         <div className="px-4 py-2 border-b border-[#1e2025] flex items-center justify-between bg-[#0d0e12]">
           <div className="flex items-center gap-3">
             <Zap size={16} className="text-emerald-400" />

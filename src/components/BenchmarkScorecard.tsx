@@ -73,7 +73,7 @@ export default function BenchmarkScorecard() {
   ];
 
   return (
-    <div className="flex flex-col h-full bg-[#07080a] border border-[#1e2025] rounded-sm p-6 overflow-y-auto custom-scrollbar">
+    <div className="flex flex-col h-full bg-[#07080a] border border-[#1e2025] rounded-sm p-6 overflow-y-auto custom-scrollbar glass-specular glass-inset">
       <div className="flex items-center justify-between mb-8 pb-4 border-b border-[#1e2025]">
         <div className="flex items-center gap-3">
           <BarChart className="text-cyan-400" size={24} />
@@ -105,7 +105,7 @@ export default function BenchmarkScorecard() {
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: idx * 0.1 }}
-              className="flex flex-col md:flex-row gap-4 p-4 border border-[#1e2025] bg-[#0b0c10] rounded relative overflow-hidden"
+              className="flex flex-col md:flex-row gap-4 p-4 border border-[#1e2025] bg-[#0b0c10] rounded relative overflow-hidden glass-specular glass-inset-sm"
             >
               <div className="md:w-1/4 pr-4 border-b md:border-b-0 md:border-r border-[#1e2025] flex flex-col justify-center">
                 <div className="flex items-center gap-2 mb-2">

@@ -50,7 +50,7 @@ export default function PipelineDiagnosticModal({
           initial={{ opacity: 0, scale: 0.95, y: 20 }}
           animate={{ opacity: 1, scale: 1, y: 0 }}
           exit={{ opacity: 0, scale: 0.95, y: 20 }}
-          className="bg-[#0b0c10] border border-[#1e2025] rounded-xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col font-mono text-sm overflow-hidden"
+          className="bg-[#0b0c10] border border-[#1e2025] rounded-xl shadow-[inset_0_1px_0_rgba(255,255,255,0.07),inset_0_0_32px_rgba(0,0,0,0.38),0_25px_50px_-12px_rgba(0,0,0,0.5)] glass-specular w-full max-w-4xl max-h-[90vh] flex flex-col font-mono text-sm overflow-hidden"
         >
           {/* Header */}
           <div className="flex items-center justify-between p-4 border-b border-[#1e2025] bg-[#07080a]">

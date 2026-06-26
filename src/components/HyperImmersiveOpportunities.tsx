@@ -43,7 +43,7 @@ export default function HyperImmersiveOpportunities({ opportunities, diagnostics
   // Background grid animation logic could be added here
   
   return (
-    <div className="relative w-full h-full min-h-[400px] bg-[#050505] overflow-hidden rounded-xl border border-cyan-500/20 shadow-[0_0_40px_rgba(0,255,255,0.05)] p-6 font-mono">
+    <div className="relative w-full h-full min-h-[400px] bg-[#050505] overflow-hidden rounded-xl border border-cyan-500/20 shadow-[inset_0_1px_0_rgba(255,255,255,0.07),inset_0_0_32px_rgba(0,0,0,0.38),0_0_40px_rgba(0,255,255,0.05)] glass-specular p-6 font-mono">
       {/* Immersive Background Effects */}
       <div className="absolute inset-0 pointer-events-none">
         <div className="absolute top-0 left-0 w-full h-[1px] bg-gradient-to-r from-transparent via-cyan-500 to-transparent opacity-30" />

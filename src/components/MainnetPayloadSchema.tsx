@@ -130,7 +130,7 @@ const payloadStructures = [
 
 export default function MainnetPayloadSchema() {
   return (
-    <div className="border border-[#1e2025] bg-[#0d0e12] rounded-md p-4 font-mono text-[10px] text-gray-300 max-h-64 overflow-y-auto scrollbar-thin">
+    <div className="border border-[#1e2025] bg-[#0d0e12] rounded-md p-4 font-mono text-[10px] text-gray-300 max-h-64 overflow-y-auto scrollbar-thin glass-specular glass-inset">
       <div className="flex items-center justify-between mb-4 pb-2 border-b border-[#1e2025]">
         <h3 className="text-cyan-400 font-bold uppercase flex items-center gap-2">
           <Target className="w-4 h-4 text-emerald-400" />

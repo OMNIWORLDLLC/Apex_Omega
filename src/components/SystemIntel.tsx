@@ -61,7 +61,7 @@ export default function SystemIntel({
     <div className="w-full flex flex-col gap-3 font-mono text-[10px] select-none h-full overflow-y-auto">
       {/* 4 Stats Cards */}
       <div className="grid grid-cols-2 gap-2 shrink-0">
-        <div className="p-2 border border-[#1e2025] bg-[#0d0e12] rounded-sm relative">
+        <div className="p-2 border border-[#1e2025] bg-[#0d0e12] rounded-sm relative glass-specular glass-inset-sm">
           <div className="absolute top-0 left-0 w-1.5 h-1.5 border-t border-l border-[#00f5a0]/40" />
           <div className="text-[7.5px] text-gray-500 uppercase tracking-widest mb-1.5">
             WIN RATE
@@ -74,7 +74,7 @@ export default function SystemIntel({
           </div>
         </div>
 
-        <div className="p-2 border border-[#1e2025] bg-[#0d0e12] rounded-sm relative">
+        <div className="p-2 border border-[#1e2025] bg-[#0d0e12] rounded-sm relative glass-specular glass-inset-sm">
           <div className="absolute top-0 left-0 w-1.5 h-1.5 border-t border-l border-cyan-500/40" />
           <div className="text-[7.5px] text-gray-500 uppercase tracking-widest mb-1.5">
             EXEC / HR
@@ -87,7 +87,7 @@ export default function SystemIntel({
           </div>
         </div>
 
-        <div className="p-2 border border-[#1e2025] bg-[#0d0e12] rounded-sm relative">
+        <div className="p-2 border border-[#1e2025] bg-[#0d0e12] rounded-sm relative glass-specular glass-inset-sm">
           <div className="absolute top-0 left-0 w-1.5 h-1.5 border-t border-l border-yellow-500/40" />
           <div className="text-[7.5px] text-gray-500 uppercase tracking-widest mb-1.5">
             AVG PROFIT
@@ -100,7 +100,7 @@ export default function SystemIntel({
           </div>
         </div>
 
-        <div className="p-2 border border-[#1e2025] bg-[#0d0e12] rounded-sm relative">
+        <div className="p-2 border border-[#1e2025] bg-[#0d0e12] rounded-sm relative glass-specular glass-inset-sm">
           <div className="absolute top-0 left-0 w-1.5 h-1.5 border-t border-l border-green-500/40" />
           <div className="text-[7.5px] text-gray-500 uppercase tracking-widest mb-1.5">
             CYCLES
@@ -113,7 +113,7 @@ export default function SystemIntel({
           </div>
         </div>
 
-        <div className="p-2 border border-[#1e2025] bg-[#0d0e12] rounded-sm relative">
+        <div className="p-2 border border-[#1e2025] bg-[#0d0e12] rounded-sm relative glass-specular glass-inset-sm">
           <div className="absolute top-0 left-0 w-1.5 h-1.5 border-t border-l border-purple-500/40" />
           <div className="text-[7.5px] text-gray-500 uppercase tracking-widest mb-1.5">
             FLASH UTIL
@@ -128,7 +128,7 @@ export default function SystemIntel({
       </div>
 
       {/* Chain block status grid */}
-      <div className="border border-[#1e2025] bg-[#0d0e12] rounded-sm p-2 shrink-0">
+      <div className="border border-[#1e2025] bg-[#0d0e12] rounded-sm p-2 shrink-0 glass-specular glass-inset-sm">
         <h4 className="text-[7.5px] text-gray-500 uppercase tracking-widest border-b border-[#1e2025]/60 pb-1.5 mb-2 flex items-center justify-between">
           <span>CHAIN INTELLIGENCE MATRIX</span>
           <Layers size={10} className="text-gray-500" />

@@ -5,16 +5,19 @@ services:
     image: redis:7-alpine
     container_name: apex-redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--save", "1", "1"]
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --requirepass ${REDIS_PASSWORD:-apex_redis_secret}
     ports:
       - "${REDIS_HOST_PORT:-6379}:6379"
-    volumes:
-      - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-apex_redis_secret}", "ping"]
       interval: 10s
-      timeout: 3s
-      retries: 10
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - apex-net
 
@@ -55,6 +58,8 @@ services:
       redis:
         condition: service_healthy
       anvil-fork:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     ports:
       - "${APEX_HOST_PORT:-3000}:3000"

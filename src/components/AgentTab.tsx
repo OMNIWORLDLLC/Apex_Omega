@@ -107,7 +107,7 @@ export default function AgentTab({
   };
 
   return (
-    <div className="flex flex-col h-[400px] border border-[#1e2025] bg-[#0d0e12]/80 rounded-sm relative selection:bg-[#b388ff]/30">
+    <div className="flex flex-col h-[400px] border border-[#1e2025] bg-[#0d0e12]/80 rounded-sm relative selection:bg-[#b388ff]/30 glass-specular glass-inset">
       <div className="absolute top-0 right-0 w-2 h-2 border-t border-r border-[#b388ff]/40" />
       <div className="absolute bottom-0 left-0 w-2 h-2 border-b border-l border-[#b388ff]/40" />
 

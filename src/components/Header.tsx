@@ -88,7 +88,7 @@ export default function Header({
   };
 
   return (
-    <header className="h-10 bg-[#030408]/90 backdrop-blur-xl border-b border-cyan-900/30 flex items-center px-4 justify-between gap-4 font-mono text-[9px] shrink-0 relative z-30 select-none shadow-[0_4px_30px_rgba(0,255,255,0.05)]">
+    <header className="h-10 bg-[#030408]/90 backdrop-blur-xl border-b border-cyan-900/30 flex items-center px-4 justify-between gap-4 font-mono text-[9px] shrink-0 relative z-30 select-none shadow-[inset_0_-1px_0_rgba(255,255,255,0.04),inset_0_1px_0_rgba(255,255,255,0.07),0_4px_30px_rgba(0,255,255,0.05)] glass-specular">
       {/* Logo Section */}
       <div className="flex items-center gap-3">
         <div className="w-6 h-6 bg-gradient-to-br from-cyan-500/20 to-fuchsia-500/20 rounded shadow-[inset_0_0_8px_rgba(0,255,255,0.2)] flex items-center justify-center font-bold text-white text-[12px] border border-cyan-500/50">

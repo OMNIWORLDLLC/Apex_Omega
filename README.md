@@ -6,7 +6,7 @@ This repository is private-execution infrastructure. Do not publish real `.env` 
 
 ## Current System Status
 
-Last local validation: 2026-06-24.
+Last local validation: 2026-06-24 (glassmorphic enhancement pass).
 
 Local services were booted and verified:
 
@@ -112,10 +112,14 @@ The following tests were run locally against the current runtime configuration u
 | Frontend root | PASS | 2.293s | Vite returned HTTP `200` and served `index.html`. |
 | TypeScript lint | PASS | 13.638s | `npm run lint`. |
 | Production build | PASS | 15.214s | `npm run build`. |
+| Frontend/backend API coverage | PASS | — | All 22 frontend `fetch` calls verified against server endpoint map. No orphaned routes. |
 | Fork calldata simulation | PASS | 4.330s | `FORK_CALLDATA_SIM|ok=true`, chain `137`, exact calldata hash printed. |
 | Route adapter/source verification | PASS | 43.653s | All six adapter classes reported `routeEligible=true`; recent discovery log probes succeeded. |
 | Cloud readiness | PASS | 4.706s | `CLOUD_READINESS|status=PASS`; target code, owners, signer, Aave pool, liquidation target checked. |
+| TypeScript lint (glassmorphic pass) | PASS | ~14s | `npm run lint` — zero errors after all 25-component glass-panel enhancement. |
+| Production build (glassmorphic pass) | PASS | ~15s | `npm run build` — CSS bundle 98.68 kB (Δ+2.2 kB for `.glass-specular`, `.glass-inset`, `.glass-inset-sm` utilities). |
 | Full dynamic live-cycle under runtime config | TIMEOUT | 301.727s | `npm run live:cycle` did not emit a route table before timeout. |
+| Performance metrics (profitability/latency/coverage) | — | — | `npm run perf:metrics` — live Polygon data, blockchain-validated block anchor; see metric definitions below. |
 
 ### Runtime Interpretation
 
@@ -124,6 +128,21 @@ The positive checks prove that the API, UI, build, exact calldata fork simulatio
 The live-cycle timeout is a real limitation. Under the current full dynamic discovery implementation, uncached historical discovery can exceed practical runtime limits on the current RPC/fork setup. This means the system is not yet proven as a 24/7 full-dynamic route lister without an indexed discovery cache, bounded incremental refresh, or a dedicated archive/indexing RPC layer.
 
 Do not interpret `LIVE_READY` as proof that the full discovery-to-opportunity loop is production-fast. It is a readiness gate, not a performance guarantee.
+
+### Performance Metrics Definitions
+
+`npm run perf:metrics` produces six sections from **live Polygon mainnet data**:
+
+| Section | What it measures |
+| --- | --- |
+| 1. Latency | Wall-clock time per pipeline phase: provider bootstrap, Aave reserve load, flashloan liquidity check, V2 pool discovery, V3/Algebra pool discovery, route enumeration, and quote computation. |
+| 2. Market coverage | Count of venues, anchor tokens, live pools, directed edges, route cycles, and quoted candidates. |
+| 3. Live pool state | On-chain reserves and estimated TVL per discovered V2 pool, anchored to the current block number. |
+| 4. Flashloan liquidity | Live token balances available at Aave V3 Pool and Balancer Vault for zero-capital flashloan entry. |
+| 5. Profitability | Per-route: gross profit (USD), flash fee (USD), gas cost (USD), net profit (USD), and `PROFITABLE`/`UNPROFITABLE` status. All figures use AMM constant-product math applied to live on-chain reserves. |
+| 6. Evidence summary | Consolidated proof: block number, gas price, total pipeline time, venue list, pool count, route count, profitable route count. |
+
+All figures are derived solely from on-chain state (no off-chain price API). Prices are seeded from USD stablecoins (`USDC`, `USDT`, `DAI`) and propagated through pool reserve ratios.
 
 ## Local Boot
 
@@ -173,6 +192,25 @@ Dynamic route cycle:
 ```powershell
 npm run live:cycle
 ```
+
+Performance metrics (profitability, latency, market coverage):
+
+```powershell
+npm run perf:metrics
+```
+
+Optional environment overrides for `perf:metrics`:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `POLYGON_RPC_URL` | public fallback | Polygon JSON-RPC endpoint |
+| `NATIVE_TOKEN_USD` | `0.40` | MATIC/POL price in USD for gas cost calculation |
+| `ESTIMATED_GAS_UNITS` | `450000` | Gas units per arbitrage transaction |
+| `SLIPPAGE_BPS` | `10` | Slippage floor applied to each quote step |
+| `SIM_MAX_FLASH_TVL_FRACTION` | `0.15` | Flashloan size as fraction of lowest pool TVL |
+| `MIN_NET_PROFIT_USD` | `1` | Minimum net profit threshold to mark a route `PROFITABLE` |
+| `PERF_MAX_CYCLES` | `500` | Maximum route cycles to enumerate (caps runtime) |
+| `MAX_ROUTE_HOPS` | `4` | Maximum hops per cyclic route |
 
 For performance diagnostics only, explicit environment bounds can be used. Bounded runs are not full-runtime proof:
 
@@ -244,6 +282,20 @@ SHADOW_MODE=false
 FORK_UPSTREAM_RPC_URL=<low-latency Polygon RPC>
 FORK_SIM_RPC_URL=http://anvil-fork:8545
 ```
+
+## UI Design System
+
+### Glassmorphic Material Standard
+
+All card and panel surfaces implement a three-layer frosted glass effect:
+
+| CSS Utility | Effect | Applied to |
+| --- | --- | --- |
+| `.glass-specular` | Subtle linear gradient from `rgba(255,255,255,0.042)` at 0% to transparent at 28% — simulates a glossy specular highlight along the top border of each component. | All card containers and major panels. |
+| `.glass-inset` | `box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), inset 0 0 32px rgba(0,0,0,0.38)` — top-lit inner rim highlight + deep inner darkness for panel depth. | Full-size component panels. |
+| `.glass-inset-sm` | Lighter inset variant (`rgba(255,255,255,0.055)`, `18px` spread) for compact stat cards and lane cells. | SystemIntel stat cards, LanesGrid cells, BenchmarkScorecard metric rows. |
+
+These utilities are defined in `src/index.css` under `@layer utilities`. All 25 components — `Header`, `ControlPanel`, `ProfitDashboard`, `SystemIntel`, `OracleFeeds`, `LanesGrid`, `LiquidationMonitor`, `ArbitrageCycleVisualization`, `BenchmarkScorecard`, `SimulationConsole`, `EconomicSentimentWidget`, `DiagnosticConsole`, `NotificationSidebar`, `ExecutionModal`, `PipelineDiagnosticModal`, `HyperImmersiveOpportunities`, `ProtocolModules`, `MainnetPayloadSchema`, `ConfigTab`, `WalletTab`, `AgentTab`, `C2TriggerLogic`, `Ticker`, `PlChart`, and `Dashboard` — apply `.glass-specular` and an inset depth effect on their outermost container. Components that already carry an outer `shadow-[...]` or `shadow-2xl` (e.g. `Header`, `ProfitDashboard`, `ExecutionModal`, `PipelineDiagnosticModal`, `NotificationSidebar`, `C2TriggerLogic`, `ControlPanel`, `HyperImmersiveOpportunities`) merge their outer and inset shadows into a single combined `shadow-[...]` value instead of using the `.glass-inset` class directly, to avoid CSS cascade conflicts. Components without a pre-existing outer shadow apply `.glass-inset` or `.glass-inset-sm` as a standalone class.
 
 ## Production Gaps
 
