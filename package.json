@@ -9,7 +9,7 @@
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit",
+    "lint": "node --max-old-space-size=4096 ./node_modules/typescript/bin/tsc --noEmit",
     "test:contract-sync": "tsx scripts/contract-sync-test.ts",
     "test:signing-hash": "tsx scripts/signing-hash-test.ts",
     "test:broadcast": "tsx scripts/broadcast-test.ts",
@@ -21,6 +21,7 @@
     "live:cycle": "tsx scripts/live-cycle.ts",
     "perf:metrics": "tsx scripts/perf-metrics.ts",
     "perf:metrics:snapshot": "tsx scripts/perf-metrics.ts --snapshot"
+    "live:cycle-5": "tsx scripts/live-cycle-5.ts"
   },
   "dependencies": {
     "@google/genai": "^1.52.0",
@@ -33,10 +34,12 @@
     "ioredis": "^5.11.1",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "msgpackr": "^2.0.4",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "react-markdown": "^10.1.0",
     "recharts": "^3.8.1",
+    "redis": "^6.0.1",
     "vite": "^6.2.3",
     "ws": "^8.21.0"
   },

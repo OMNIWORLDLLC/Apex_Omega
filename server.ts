@@ -8,8 +8,20 @@ import { WebSocketServer } from "ws";
 import { DeFiExecutorManager } from "./ExecutionManager.js";
 import { InvariantMath } from "./server/engine/invariants.js";
 import RedisRouteGuard from "./server/engine/RedisRouteGuard.js";
+import {
+  getActiveLedgerCount,
+  getActiveLedgerOpportunities,
+  getRedisLedgerStatus,
+  lockOpportunityForExecution,
+  publishOpportunitySnapshot,
+  releaseOpportunityLock,
+} from "./server/redisLedger.js";
 
 const CONFIG_PATH = path.join(process.cwd(), "config.json");
+const TOP_ROUTE_DISPLAY_LIMIT = Number(process.env.TOP_ROUTE_DISPLAY_LIMIT || 50);
+const C1_EXECUTABLE_LIMIT_PER_CYCLE = Number(process.env.C1_EXECUTABLE_LIMIT_PER_CYCLE || 10);
+const C2_PER_C1_LIMIT = Number(process.env.C2_PER_C1_LIMIT || 5);
+const C2_DECISION_LIMIT_PER_CYCLE = Number(process.env.C2_DECISION_LIMIT_PER_CYCLE || 50);
 
 function readConfigFile(): Record<string, any> {
   if (!fs.existsSync(CONFIG_PATH)) return {};
@@ -864,7 +876,10 @@ async function startServer() {
 
   let latestOpportunities: any[] = [];
 
-  const getActiveOpportunities = () => latestOpportunities;
+  const getActiveOpportunities = async () => {
+    const ledgerRows = await getActiveLedgerOpportunities(TOP_ROUTE_DISPLAY_LIMIT).catch(() => null);
+    return ledgerRows ?? latestOpportunities;
+  };
 
   const recordVerifiedOnChainPnl = (rawAmount: bigint, decimals: number) => {
     if (rawAmount <= 0n) return;
@@ -883,13 +898,249 @@ async function startServer() {
     return 0;
   };
 
-  const serializeC2Instance = (instance: C2Instance) => ({
-    ...instance,
-    seed: {
-      ...instance.seed,
-      context: instance.seed.context,
-    },
-  });
+  const serializeC2Instance = (instance: C2Instance) => {
+    const actionDecisions = instance.decisions.filter((item) => item.decision === "MIRROR" || item.decision === "REVERSE");
+    return {
+      ...instance,
+      maxC2PerC1: C2_PER_C1_LIMIT,
+      c2SlotsUsed: instance.decisions.filter((item) => item.decision !== "EXPIRED").length,
+      c2ActionTxCount: actionDecisions.filter((item) => item.txHash).length,
+      c2ActionHashes: actionDecisions.filter((item) => item.txHash).map((item) => ({
+        blockNumber: item.blockNumber,
+        decision: item.decision,
+        txHash: item.txHash,
+        txHashLink: item.txHashLink,
+      })),
+      seed: {
+        ...instance.seed,
+        context: instance.seed.context,
+      },
+    };
+  };
+
+  const c2ListenerEnabled = process.env.C2_LISTENER_ENABLED !== "false";
+  let lastC2ListenerBlock = 0;
+  let isC2ListenerRunning = false;
+
+  const appendC2DecisionIfMissing = (
+    instance: C2Instance,
+    blockNumber: number,
+    decision: C2DecisionRecord,
+  ) => {
+    if (instance.decisions.some((item) => item.blockNumber === blockNumber)) return false;
+    instance.decisions.push(decision);
+    return true;
+  };
+
+  const c2MirrorEnabled = process.env.C2_AUTO_MIRROR_ENABLED !== "false";
+  const c2ReverseEnabled = process.env.C2_AUTO_REVERSE_ENABLED !== "false";
+
+  const buildReverseC2PayloadFromSeed = (instance: C2Instance) => {
+    const routeMetadata = instance.seed.context?.routeMetadata || instance.seed.context?.reverseRouteMetadata;
+    if (!routeMetadata?.reverseContext || !routeMetadata?.reverseFlashloanAmount) {
+      return {
+        ok: false as const,
+        error: "REVERSE_ROUTE_METADATA_MISSING: raw preceding calldata is not enough to safely invert route calldata or compute new flashloan size.",
+      };
+    }
+    return {
+      ok: true as const,
+      flashloanSource: Number(routeMetadata.reverseFlashloanSource ?? instance.seed.flashloanSource),
+      flashloanAsset: routeMetadata.reverseFlashloanAsset || instance.seed.flashloanAsset,
+      flashloanAmount: String(routeMetadata.reverseFlashloanAmount),
+      context: routeMetadata.reverseContext,
+    };
+  };
+
+  const withFreshVmNonce = async (targetContract: string, context: any) => {
+    const nonce = await getVmGlobalNonce(targetContract);
+    return {
+      ...context,
+      nonce,
+    };
+  };
+
+  const evaluateC2DecisionForBlock = async (instance: C2Instance, currentBlock: number): Promise<C2DecisionRecord> => {
+    const cfg = getRuntimeConfig();
+    const targetContract = instance.seed.targetContract || cfg.C2_ARB_EXECUTOR_ADDRESS || cfg.C2_TARGET || cfg.C1_ARB_EXECUTOR_ADDRESS || cfg.C1_TARGET || cfg.ARB_CONTRACT_ADDRESS;
+    const baseRecord = {
+      blockNumber: currentBlock,
+      createdAt: Date.now(),
+    };
+
+    const lockPayload = {
+      routeId: `C2:${instance.c1Hash}:${currentBlock}`,
+      payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+      c1Hash: instance.c1Hash,
+      c1InternalId: instance.c1InternalId,
+      blockNumber: currentBlock,
+      targetContract,
+    };
+    const lock = await lockOpportunityForExecution(lockPayload, Number(process.env.REDIS_C2_DECISION_LOCK_TTL_MS || 20_000));
+    if (!lock.ok) {
+      return {
+        ...baseRecord,
+        decision: "DO_NOTHING",
+        routeEvaluation: {
+          listener: "C2_BLOCK_LISTENER",
+          gate: "C2_DECISION_LOCK_BLOCKED",
+          reason: lock.reason,
+          redisId: lock.id,
+          txCreated: false,
+        },
+      };
+    }
+
+    try {
+      if (c2MirrorEnabled && targetContract && instance.seed.context) {
+        const mirrorContext = await withFreshVmNonce(targetContract, instance.seed.context);
+        const mirrorResult = await defiExecutor.broadcastFlashloanIntegratedC2Payload(
+          targetContract,
+          instance.c1InternalId,
+          Number(instance.seed.flashloanSource ?? DEFAULT_FLASHLOAN_SOURCE_AAVE_V3),
+          instance.seed.flashloanAsset,
+          instance.seed.flashloanAmount,
+          mirrorContext,
+        );
+
+        if (mirrorResult.success && mirrorResult.hash) {
+          await releaseOpportunityLock(lock.id, "C2_MIRROR_PENDING", {
+            txHash: mirrorResult.hash,
+            txHashLink: mirrorResult.hashLink || getExplorerTxLink(mirrorResult.hash),
+            blockNumber: currentBlock,
+          });
+          return {
+            ...baseRecord,
+            decision: "MIRROR",
+            txHash: mirrorResult.hash,
+            txHashLink: mirrorResult.hashLink || getExplorerTxLink(mirrorResult.hash),
+            result: mirrorResult,
+            routeEvaluation: {
+              listener: "C2_BLOCK_LISTENER",
+              gate: "MIRROR_FORK_SIM_AND_PROFIT_GATES_PASSED",
+              reusedPrecedingPayloadContext: true,
+              txCreated: true,
+            },
+          };
+        }
+
+        if (c2ReverseEnabled) {
+          const reversePayload = buildReverseC2PayloadFromSeed(instance);
+          if (reversePayload.ok) {
+            const reverseContext = await withFreshVmNonce(targetContract, reversePayload.context);
+            const reverseResult = await defiExecutor.broadcastFlashloanIntegratedC2Payload(
+              targetContract,
+              instance.c1InternalId,
+              reversePayload.flashloanSource,
+              reversePayload.flashloanAsset,
+              reversePayload.flashloanAmount,
+              reverseContext,
+            );
+            if (reverseResult.success && reverseResult.hash) {
+              await releaseOpportunityLock(lock.id, "C2_REVERSE_PENDING", {
+                txHash: reverseResult.hash,
+                txHashLink: reverseResult.hashLink || getExplorerTxLink(reverseResult.hash),
+                blockNumber: currentBlock,
+              });
+              return {
+                ...baseRecord,
+                decision: "REVERSE",
+                txHash: reverseResult.hash,
+                txHashLink: reverseResult.hashLink || getExplorerTxLink(reverseResult.hash),
+                result: reverseResult,
+                routeEvaluation: {
+                  listener: "C2_BLOCK_LISTENER",
+                  gate: "REVERSE_FORK_SIM_AND_PROFIT_GATES_PASSED",
+                  newFlashloanSize: reversePayload.flashloanAmount,
+                  txCreated: true,
+                },
+              };
+            }
+            await releaseOpportunityLock(lock.id, "C2_NO_OP", {
+              mirrorError: mirrorResult.error,
+              reverseError: reverseResult.error,
+              blockNumber: currentBlock,
+            });
+            return {
+              ...baseRecord,
+              decision: "DO_NOTHING",
+              result: reverseResult,
+              routeEvaluation: {
+                listener: "C2_BLOCK_LISTENER",
+                gate: "MIRROR_AND_REVERSE_FAILED_GATES",
+                mirrorError: mirrorResult.error,
+                reverseError: reverseResult.error,
+                txCreated: false,
+              },
+            };
+          }
+
+          await releaseOpportunityLock(lock.id, "C2_NO_OP", {
+            mirrorError: mirrorResult.error,
+            reverseError: reversePayload.error,
+            blockNumber: currentBlock,
+          });
+          return {
+            ...baseRecord,
+            decision: "DO_NOTHING",
+            result: mirrorResult,
+            routeEvaluation: {
+              listener: "C2_BLOCK_LISTENER",
+              gate: "MIRROR_FAILED_REVERSE_UNAVAILABLE",
+              mirrorError: mirrorResult.error,
+              reverseError: reversePayload.error,
+              txCreated: false,
+            },
+          };
+        }
+
+        await releaseOpportunityLock(lock.id, "C2_NO_OP", {
+          mirrorError: mirrorResult.error,
+          blockNumber: currentBlock,
+        });
+        return {
+          ...baseRecord,
+          decision: "DO_NOTHING",
+          result: mirrorResult,
+          routeEvaluation: {
+            listener: "C2_BLOCK_LISTENER",
+            gate: "MIRROR_FAILED_REVERSE_DISABLED",
+            mirrorError: mirrorResult.error,
+            txCreated: false,
+          },
+        };
+      }
+
+      await releaseOpportunityLock(lock.id, "C2_NO_OP", {
+        error: "C2_MIRROR_DISABLED_OR_SEED_CONTEXT_MISSING",
+        blockNumber: currentBlock,
+      });
+      return {
+        ...baseRecord,
+        decision: "DO_NOTHING",
+        routeEvaluation: {
+          listener: "C2_BLOCK_LISTENER",
+          gate: "C2_MIRROR_DISABLED_OR_SEED_CONTEXT_MISSING",
+          txCreated: false,
+        },
+      };
+    } catch (error: any) {
+      await releaseOpportunityLock(lock.id, "C2_NO_OP", {
+        error: error?.message || "C2 decision evaluation failed",
+        blockNumber: currentBlock,
+      });
+      return {
+        ...baseRecord,
+        decision: "DO_NOTHING",
+        routeEvaluation: {
+          listener: "C2_BLOCK_LISTENER",
+          gate: "C2_DECISION_EXCEPTION",
+          error: error?.message || "C2 decision evaluation failed",
+          txCreated: false,
+        },
+      };
+    }
+  };
 
   const initializeC2InstanceFromC1 = async (hash: string, receipt: any, pending: any) => {
     if (pending.payloadKind !== "FLASHLOAN_INTEGRATED_C1_PAYLOADS") return null;
@@ -937,6 +1188,89 @@ async function startServer() {
     return instance;
   };
 
+  const runC2BlockListener = async (currentBlock: number) => {
+    if (!c2ListenerEnabled || isC2ListenerRunning || currentBlock <= 0 || currentBlock === lastC2ListenerBlock) return;
+    isC2ListenerRunning = true;
+    try {
+      lastC2ListenerBlock = currentBlock;
+      let c2DecisionsThisCycle = 0;
+      for (const instance of c2Instances.values()) {
+        if (c2DecisionsThisCycle >= C2_DECISION_LIMIT_PER_CYCLE) {
+          systemLogQueue.push({ tag: "C2", message: `C2 LISTENER LIMIT: ${C2_DECISION_LIMIT_PER_CYCLE} block decisions reached for cycle block ${currentBlock}. Remaining pending instances deferred.` });
+          break;
+        }
+        if (instance.status !== "PENDING") continue;
+        if (currentBlock < instance.firstEligibleBlock) continue;
+        if (instance.decisions.filter((item) => item.decision !== "EXPIRED").length >= C2_PER_C1_LIMIT) {
+          instance.status = "EXPIRED";
+          instance.finalDecision = instance.finalDecision || "EXPIRED";
+          systemLogQueue.push({ tag: "C2", message: `C2 SLOT LIMIT: C1 ${instance.c1HashLink} already used ${C2_PER_C1_LIMIT}/${C2_PER_C1_LIMIT} block slots.` });
+          continue;
+        }
+
+        if (currentBlock > instance.expiresAfterBlock) {
+          instance.status = "EXPIRED";
+          instance.finalDecision = "EXPIRED";
+          const added = appendC2DecisionIfMissing(instance, currentBlock, {
+            blockNumber: currentBlock,
+            decision: "EXPIRED",
+            createdAt: Date.now(),
+            routeEvaluation: {
+              listener: "C2_BLOCK_LISTENER",
+              gate: "C2_WINDOW_EXPIRED",
+              window: `${instance.firstEligibleBlock}-${instance.expiresAfterBlock}`,
+              txCreated: false,
+            },
+          });
+          if (added) {
+            c2DecisionsThisCycle += 1;
+            bumpStage("C2_ACTION");
+            systemLogQueue.push({ tag: "C2", message: `C2 LISTENER EXPIRED: C1 ${instance.c1HashLink}; current block ${currentBlock}; no tx hash created.` });
+          }
+          continue;
+        }
+
+        bumpStage("C2_RECOMPUTE_FROM_PAIRED_C1");
+        const decision = await evaluateC2DecisionForBlock(instance, currentBlock);
+        const added = appendC2DecisionIfMissing(instance, currentBlock, decision);
+        if (added) {
+          c2DecisionsThisCycle += 1;
+          if (decision.txHash) {
+            globalTxCounter++;
+            totalSettledCycles++;
+            bumpStage("C2_EXECUTION");
+            const profitReceiver = getConfiguredProfitReceiver();
+            const profitAsset = getConfiguredProfitAsset();
+            pendingSettlements.set(decision.txHash.toLowerCase(), {
+              payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+              hash: decision.txHash,
+              hashLink: decision.txHashLink || getExplorerTxLink(decision.txHash),
+              profitReceiver,
+              receiverLink: getExplorerAddressLink(profitReceiver),
+              profitAsset,
+              preBalance: await fetchTokenBalance(profitAsset, profitReceiver),
+              submittedAt: Date.now(),
+              verified: false,
+            });
+            instance.finalDecision = decision.decision === "MIRROR" || decision.decision === "REVERSE" ? decision.decision : instance.finalDecision;
+            instance.c2Hash = decision.txHash;
+            instance.c2HashLink = decision.txHashLink || getExplorerTxLink(decision.txHash);
+            systemLogQueue.push({ tag: "C2", message: `C2 LISTENER ${decision.decision}: HASH PRINTED ${decision.txHashLink || getExplorerTxLink(decision.txHash)} for C1 ${instance.c1HashLink}; P&L locked pending on-chain verification.` });
+          } else {
+            systemLogQueue.push({ tag: "C2", message: `C2 LISTENER ${decision.decision}: C1 ${instance.c1HashLink} evaluated at block ${currentBlock}; no tx hash created.` });
+          }
+          if (currentBlock >= instance.expiresAfterBlock) {
+            instance.status = "EXPIRED";
+            instance.finalDecision = instance.finalDecision || "EXPIRED";
+          }
+          bumpStage("C2_ACTION");
+        }
+      }
+    } finally {
+      isC2ListenerRunning = false;
+    }
+  };
+
   const bumpStage = (name: string, amount: number = 1) => {
     const stage = pipelineStages.find((item) => item.name === name);
     if (stage) stage.count += amount;
@@ -958,6 +1292,7 @@ async function startServer() {
       const liveBlock = await queryPolygonRPC("eth_blockNumber", []);
       if (liveBlock) {
         liveBlockNumber = parseInt(liveBlock, 16);
+        await runC2BlockListener(liveBlockNumber);
       }
 
       gasGwei = await fetchGasGwei();
@@ -1019,6 +1354,7 @@ async function startServer() {
       paused: isEnginePaused,
       dryRun: isDryRun,
       status: isEnginePaused ? "PAUSED" : "OPERATIONAL",
+      redisLedger: getRedisLedgerStatus(),
     });
   });
 
@@ -1166,6 +1502,7 @@ async function startServer() {
   });
 
   app.get("/api/execution/pipeline", (req, res) => {
+    const c2DecisionCount = [...c2Instances.values()].reduce((sum, instance) => sum + instance.decisions.length, 0);
     res.json({
       stages: pipelineStages.map((stage) => {
         if (stage.name === "ARCHIVE") return { ...stage, count: totalTrades };
@@ -1179,6 +1516,23 @@ async function startServer() {
         lifespan: "C1_BLOCK_PLUS_1_THROUGH_C1_BLOCK_PLUS_5",
         decisions: ["DO_NOTHING", "MIRROR", "REVERSE"],
         hashRule: "ONLY_MIRROR_OR_REVERSE_CAN_CREATE_C2_HASH",
+        listener: {
+          enabled: c2ListenerEnabled,
+          mirrorEnabled: c2MirrorEnabled,
+          reverseEnabled: c2ReverseEnabled,
+          lastBlock: lastC2ListenerBlock,
+          mode: "BLOCK_DRIVEN_PENDING_C1_WINDOW_ONLY",
+          decisionOrder: ["MIRROR_SAME_CALLDATA_AGAINST_NEW_STATE", "REVERSE_REBUILT_CALLDATA_WITH_NEW_FLASHLOAN_SIZE", "DO_NOTHING"],
+        },
+      },
+      routeLimits: {
+        topRouteDisplayLimit: TOP_ROUTE_DISPLAY_LIMIT,
+        c1ExecutableLimitPerCycle: C1_EXECUTABLE_LIMIT_PER_CYCLE,
+        c2PerC1Limit: C2_PER_C1_LIMIT,
+        c2DecisionLimitPerCycle: C2_DECISION_LIMIT_PER_CYCLE,
+        c2DecisionCount,
+        c2CapacityFormula: `${C1_EXECUTABLE_LIMIT_PER_CYCLE} C1 x ${C2_PER_C1_LIMIT} C2 = ${C1_EXECUTABLE_LIMIT_PER_CYCLE * C2_PER_C1_LIMIT}`,
+        c2RequiresConfirmedC1: true,
       },
 
       // Reserve Cache data merged for easier consumption
@@ -1202,12 +1556,29 @@ async function startServer() {
   });
 
   // Dual Spread Opportunity feeds
-  app.get("/api/execution/opportunities", (req, res) => {
+  app.get("/api/execution/opportunities", async (req, res) => {
+    const activeOpportunities = await getActiveOpportunities();
+    const activeRouteCount = await getActiveLedgerCount().catch(() => null);
+    const c1ExecutableVisible = activeOpportunities.filter((item: any) => item.c1ExecutionEligible || item.executionReady).length;
+    const c2DecisionCount = [...c2Instances.values()].reduce((sum, instance) => sum + instance.decisions.length, 0);
     res.json({
-      opportunities: getActiveOpportunities(),
+      opportunities: activeOpportunities,
       source: "live",
+      redisLedger: getRedisLedgerStatus(),
+      routeLimits: {
+        totalRoutesObserved: activeRouteCount ?? activeOpportunities.length,
+        topRouteDisplayLimit: TOP_ROUTE_DISPLAY_LIMIT,
+        visibleRoutes: activeOpportunities.length,
+        c1ExecutableVisible,
+        c1ExecutableLimitPerCycle: C1_EXECUTABLE_LIMIT_PER_CYCLE,
+        c2PerC1Limit: C2_PER_C1_LIMIT,
+        c2DecisionLimitPerCycle: C2_DECISION_LIMIT_PER_CYCLE,
+        c2DecisionCount,
+        c2CapacityFormula: `${C1_EXECUTABLE_LIMIT_PER_CYCLE} C1 x ${C2_PER_C1_LIMIT} C2 = ${C1_EXECUTABLE_LIMIT_PER_CYCLE * C2_PER_C1_LIMIT}`,
+        c2RequiresConfirmedC1: true,
+      },
       diagnostics: {
-        summary: latestOpportunities.length ? "Live arbitrage scanner found executable spread candidates." : "No live executable spreads observed.",
+        summary: activeOpportunities.length ? "Live arbitrage scanner found executable spread candidates." : "No live executable spreads observed.",
         profit_gate: { blocked_count: 0 },
         gas_gate: { blocked_count: 0 },
         slippage_gate: { blocked_count: 0 },
@@ -1215,15 +1586,22 @@ async function startServer() {
           ready_pools: reservePoolsCount,
           total_pools: pools.length,
           scanable_pairs: pools.length,
-          cached_spreads: latestOpportunities.length,
+          cached_spreads: activeOpportunities.length,
+          total_routes_observed: activeRouteCount ?? activeOpportunities.length,
+          top_50_routes_visible: Math.min(activeOpportunities.length, TOP_ROUTE_DISPLAY_LIMIT),
+          c1_executable_visible: c1ExecutableVisible,
+          c1_executable_limit_per_cycle: C1_EXECUTABLE_LIMIT_PER_CYCLE,
+          c2_per_c1_limit: C2_PER_C1_LIMIT,
+          c2_decision_limit_per_cycle: C2_DECISION_LIMIT_PER_CYCLE,
+          c2_decision_count: c2DecisionCount,
           summary: reservePoolsCount > 0 ? "Live reserves polled successfully" : "Awaiting live reserve sync",
         },
       },
     });
   });
 
-  app.get("/api/dashboard/opportunities", (req, res) => {
-    res.json(getActiveOpportunities());
+  app.get("/api/dashboard/opportunities", async (req, res) => {
+    res.json(await getActiveOpportunities());
   });
 
   // 32-Lane Executor Status
@@ -1281,6 +1659,7 @@ async function startServer() {
       const flashloanAsset = req.body.flashloanAsset;
       const flashloanAmount = req.body.flashloanAmount;
       const context = req.body.context;
+      const redisId = typeof req.body.redisId === "string" ? req.body.redisId : "";
 
       if (!targetContract || !flashloanAsset || !flashloanAmount || !context) {
         return res.status(400).json({
@@ -1340,11 +1719,23 @@ async function startServer() {
             },
           });
           systemLogQueue.push({ tag: "C1", message: `HASH PRINTED: ${result.hashLink || getExplorerTxLink(result.hash)} | P&L locked pending AI/on-chain verification for ${profitReceiver}` });
+          if (redisId) {
+            await releaseOpportunityLock(redisId, "C1_PENDING", {
+              txHash: result.hash,
+              txHashLink: result.hashLink || getExplorerTxLink(result.hash),
+              payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
+            });
+          }
         }
       } else {
         // Release the lock immediately on broadcast failure so the route
         // can be retried by the same or another worker.
         await redisGuard.releaseLock(c1RouteKey);
+      } else if (redisId) {
+        await releaseOpportunityLock(redisId, "C1_REJECTED", {
+          error: result.error || "C1 execution rejected",
+          payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
+        });
       }
 
       res.status(result.success ? 200 : 409).json(result);
@@ -1378,17 +1769,72 @@ async function startServer() {
         return res.status(409).json({
           success: false,
           error: "C2_LOCK_HELD: a C2 settlement for this c1InternalId is already in-flight on another worker.",
+      const pairedC1Instance = [...c2Instances.values()].find(
+        (instance) => instance.c1InternalId.toLowerCase() === String(c1InternalId).toLowerCase(),
+      );
+      if (!pairedC1Instance) {
+        return res.status(409).json({
+          success: false,
+          error: "NO_CONFIRMED_C1_INSTANCE_NO_C2",
+          rule: "C2 requires a confirmed C1 hash/internal id initialized by this service.",
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+        });
+      }
+      if (pairedC1Instance.status !== "PENDING") {
+        return res.status(409).json({
+          success: false,
+          error: `C2_INSTANCE_${pairedC1Instance.status}`,
+          c1Hash: pairedC1Instance.c1Hash,
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+        });
+      }
+      const liveBlockHex = await queryPolygonRPC("eth_blockNumber", []);
+      const currentBlock = parseRpcBlockNumber(liveBlockHex);
+      if (currentBlock < pairedC1Instance.firstEligibleBlock || currentBlock > pairedC1Instance.expiresAfterBlock) {
+        return res.status(409).json({
+          success: false,
+          error: "C2_BLOCK_OUTSIDE_C1_WINDOW",
+          currentBlock,
+          firstEligibleBlock: pairedC1Instance.firstEligibleBlock,
+          expiresAfterBlock: pairedC1Instance.expiresAfterBlock,
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+        });
+      }
+      if (pairedC1Instance.decisions.some((item) => item.blockNumber === currentBlock)) {
+        return res.status(409).json({
+          success: false,
+          error: "C2_BLOCK_ALREADY_EVALUATED",
+          currentBlock,
+          payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
+        });
+      }
+      if (pairedC1Instance.decisions.filter((item) => item.decision !== "EXPIRED").length >= C2_PER_C1_LIMIT) {
+        pairedC1Instance.status = "EXPIRED";
+        pairedC1Instance.finalDecision = pairedC1Instance.finalDecision || "EXPIRED";
+        return res.status(409).json({
+          success: false,
+          error: "C2_PER_C1_LIMIT_REACHED",
+          limit: C2_PER_C1_LIMIT,
           payloadKind: "FLASHLOAN_INTEGRATED_C2_PAYLOADS",
         });
       }
 
       const result = await defiExecutor.broadcastFlashloanIntegratedC2Payload(targetContract, c1InternalId, flashloanSource, flashloanAsset, flashloanAmount, context);
+      const record: C2DecisionRecord = {
+        blockNumber: currentBlock,
+        decision: "MIRROR",
+        createdAt: Date.now(),
+        routeEvaluation: { source: "DIRECT_C2_ENDPOINT", gate: result.success ? "ACTIONABLE" : "BLOCKED" },
+        result,
+      };
 
       if (result.success) {
         globalTxCounter++;
         totalSettledCycles++;
         bumpStage("C2_EXECUTION");
         if (result.hash) {
+          record.txHash = result.hash;
+          record.txHashLink = result.hashLink || getExplorerTxLink(result.hash);
           const profitReceiver = getConfiguredProfitReceiver();
           const profitAsset = getConfiguredProfitAsset();
           pendingSettlements.set(result.hash.toLowerCase(), {
@@ -1408,6 +1854,11 @@ async function startServer() {
       } else {
         // Release lock on broadcast failure so retries are possible
         await redisGuard.releaseLock(c2RouteKey);
+      }
+      pairedC1Instance.decisions.push(record);
+      if (pairedC1Instance.decisions.filter((item) => item.decision !== "EXPIRED").length >= C2_PER_C1_LIMIT || currentBlock >= pairedC1Instance.expiresAfterBlock) {
+        pairedC1Instance.status = "EXPIRED";
+        pairedC1Instance.finalDecision = pairedC1Instance.finalDecision || "EXPIRED";
       }
 
       res.status(result.success ? 200 : 409).json(result);
@@ -1479,6 +1930,17 @@ async function startServer() {
           instance: serializeC2Instance(instance),
         });
       }
+      if (instance.decisions.filter((item) => item.decision !== "EXPIRED").length >= C2_PER_C1_LIMIT) {
+        instance.status = "EXPIRED";
+        instance.finalDecision = instance.finalDecision || "EXPIRED";
+        return res.status(409).json({
+          success: false,
+          error: "C2_PER_C1_LIMIT_REACHED",
+          limit: C2_PER_C1_LIMIT,
+          currentBlock,
+          instance: serializeC2Instance(instance),
+        });
+      }
 
       bumpStage("C2_RECOMPUTE_FROM_PAIRED_C1");
 
@@ -1525,6 +1987,7 @@ async function startServer() {
       if (!targetContract || !flashloanAsset || !flashloanAmount || !context) {
         return res.status(400).json({ success: false, error: "INVALID_C2_EVALUATION_PAYLOAD", currentBlock, decision });
       }
+      const c2Context = await withFreshVmNonce(targetContract, context);
 
       const result = await defiExecutor.broadcastFlashloanIntegratedC2Payload(
         targetContract,
@@ -1532,7 +1995,7 @@ async function startServer() {
         flashloanSource,
         flashloanAsset,
         flashloanAmount,
-        context,
+        c2Context,
       );
 
       const record: C2DecisionRecord = {
@@ -1546,7 +2009,6 @@ async function startServer() {
       if (result.success && result.hash) {
         record.txHash = result.hash;
         record.txHashLink = result.hashLink || getExplorerTxLink(result.hash);
-        instance.status = "EXECUTED";
         instance.executedAt = Date.now();
         instance.finalDecision = decision;
         instance.c2Hash = result.hash;
@@ -1576,6 +2038,10 @@ async function startServer() {
       }
 
       instance.decisions.push(record);
+      if (instance.decisions.filter((item) => item.decision !== "EXPIRED").length >= C2_PER_C1_LIMIT || currentBlock >= instance.expiresAfterBlock) {
+        instance.status = "EXPIRED";
+        instance.finalDecision = instance.finalDecision || "EXPIRED";
+      }
       res.status(result.success ? 200 : 409).json({
         success: result.success,
         decision,
@@ -1995,7 +2461,7 @@ async function startServer() {
          });
        }
 
-       latestOpportunities = newOpportunities;
+       latestOpportunities = await publishOpportunitySnapshot(newOpportunities, "proactive-arb-sweep");
        reservePoolsCount = livePoolAddresses.size;
        reserveDirtyCount = 0;
        reserveStaleCount = pools.length - livePoolAddresses.size;

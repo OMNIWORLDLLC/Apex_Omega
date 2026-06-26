@@ -5,11 +5,16 @@ import { Copy, ArrowRight, Activity, Zap, ShieldAlert, Cpu } from "lucide-react"
 interface Opportunity {
   pair: string;
   route?: string;
-  spread_bps: number;
-  profit_usd: number;
+  spread_bps?: number;
+  profit_usd?: number;
   dex_a?: string;
   dex_b?: string;
   confidence?: number;
+  c1ExecutionEligible?: boolean;
+  c1ExecutionSlot?: number;
+  status?: string;
+  path?: string;
+  venues?: string;
 }
 
 interface HyperImmersiveOpportunitiesProps {
@@ -21,6 +26,15 @@ interface HyperImmersiveOpportunitiesProps {
 export default function HyperImmersiveOpportunities({ opportunities, diagnostics, connectionStatus = "poll" }: HyperImmersiveOpportunitiesProps) {
   const [activeId, setActiveId] = useState<number | null>(null);
   const discovery = diagnostics?.discovery || {};
+  const routeLimits = diagnostics?.routeLimits || {};
+  const totalRoutes = discovery.total_routes_observed ?? routeLimits.totalRoutesObserved ?? opportunities.length;
+  const topRouteLimit = routeLimits.topRouteDisplayLimit ?? discovery.top_50_routes_visible ?? 50;
+  const visibleRoutes = routeLimits.visibleRoutes ?? opportunities.length;
+  const c1ExecutableVisible = discovery.c1_executable_visible ?? routeLimits.c1ExecutableVisible ?? opportunities.filter((opp) => opp.c1ExecutionEligible || opp.status === "EXECUTABLE_PROFIT_CANDIDATE").length;
+  const c1Limit = routeLimits.c1ExecutableLimitPerCycle ?? discovery.c1_executable_limit_per_cycle ?? 10;
+  const c2PerC1Limit = routeLimits.c2PerC1Limit ?? discovery.c2_per_c1_limit ?? 5;
+  const c2Limit = routeLimits.c2DecisionLimitPerCycle ?? discovery.c2_decision_limit_per_cycle ?? 50;
+  const c2DecisionCount = routeLimits.c2DecisionCount ?? discovery.c2_decision_count ?? 0;
   const statusText = connectionStatus === "live"
     ? diagnostics?.summary || "Live opportunity feed connected"
     : "API feed disconnected or returning invalid data";
@@ -72,6 +86,25 @@ export default function HyperImmersiveOpportunities({ opportunities, diagnostics
           </div>
         </div>
 
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-5 text-[10px] uppercase tracking-wider">
+          <div className="border border-cyan-500/15 bg-black/30 rounded-md px-3 py-2">
+            <span className="block text-gray-600">Total Routes</span>
+            <span className="text-cyan-300 font-bold">{totalRoutes}</span>
+          </div>
+          <div className="border border-cyan-500/15 bg-black/30 rounded-md px-3 py-2">
+            <span className="block text-gray-600">Top Routes</span>
+            <span className="text-cyan-300 font-bold">{visibleRoutes}/{topRouteLimit}</span>
+          </div>
+          <div className="border border-cyan-500/15 bg-black/30 rounded-md px-3 py-2">
+            <span className="block text-gray-600">C1 Exec Top</span>
+            <span className="text-emerald-300 font-bold">{c1ExecutableVisible}/{c1Limit}</span>
+          </div>
+          <div className="border border-cyan-500/15 bg-black/30 rounded-md px-3 py-2">
+            <span className="block text-gray-600">C2 {c1Limit}x{c2PerC1Limit}</span>
+            <span className="text-yellow-300 font-bold">{c2DecisionCount}/{c2Limit}</span>
+          </div>
+        </div>
+
         {/* Opportunity Grid */}
         <div className="flex-1 overflow-y-auto pr-2 scrollbar-none">
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pb-4">
@@ -98,18 +131,21 @@ export default function HyperImmersiveOpportunities({ opportunities, diagnostics
                   <div className="p-5 flex flex-col h-full relative z-10">
                     <div className="flex justify-between items-start mb-4">
                       <div>
-                        <div className="text-xs text-cyan-500 font-bold tracking-widest mb-1">{opp.pair}</div>
+                        <div className="text-xs text-cyan-500 font-bold tracking-widest mb-1">{opp.pair || opp.path || "ROUTE"}</div>
                         <div className="flex items-center gap-2 text-[10px] text-gray-400 tracking-wider font-semibold">
-                          <span className="px-1.5 py-0.5 rounded bg-gray-800 text-gray-300">{opp.dex_a || "UNISWAP"}</span>
+                          <span className="px-1.5 py-0.5 rounded bg-gray-800 text-gray-300">{opp.dex_a || "DEX-A"}</span>
                           <ArrowRight className="w-3 h-3 text-cyan-500" />
-                          <span className="px-1.5 py-0.5 rounded bg-gray-800 text-gray-300">{opp.dex_b || "QUICKSWAP"}</span>
+                          <span className="px-1.5 py-0.5 rounded bg-gray-800 text-gray-300">{opp.dex_b || "DEX-B"}</span>
                         </div>
                       </div>
                       <div className="flex flex-col items-end">
                         <span className="text-lg font-bold text-[#00f5a0] leading-none drop-shadow-[0_0_8px_rgba(0,245,160,0.3)]">
-                          +${opp.profit_usd.toFixed(2)}
+                          {Number(opp.profit_usd || 0) >= 0 ? "+" : ""}${Number(opp.profit_usd || 0).toFixed(2)}
                         </span>
-                        <span className="text-[9px] text-[#00f5a0]/60 mt-1 uppercase tracking-wider">{opp.spread_bps} BPS</span>
+                        <span className="text-[9px] text-[#00f5a0]/60 mt-1 uppercase tracking-wider">{opp.spread_bps ?? 0} BPS</span>
+                        <span className={`text-[8px] mt-1 uppercase tracking-wider ${opp.c1ExecutionEligible ? "text-emerald-300" : "text-gray-500"}`}>
+                          {opp.c1ExecutionEligible ? `C1 SLOT ${opp.c1ExecutionSlot}` : "LIST ONLY"}
+                        </span>
                       </div>
                     </div>
 
@@ -128,6 +164,13 @@ export default function HyperImmersiveOpportunities({ opportunities, diagnostics
                       </div>
                     </div>
 
+                    {(opp.path || opp.venues) && (
+                      <div className="mt-3 text-[9px] text-gray-500 leading-relaxed break-words">
+                        {opp.path && <div>{opp.path}</div>}
+                        {opp.venues && <div className="text-gray-600">{opp.venues}</div>}
+                      </div>
+                    )}
+
                     {/* Cyber Glitch Detail on Hover */}
                     <AnimatePresence>
                       {activeId === idx && (
@@ -139,10 +182,10 @@ export default function HyperImmersiveOpportunities({ opportunities, diagnostics
                         >
                            <div className="flex items-center gap-1.5 text-[9px] text-cyan-300 tracking-widest">
                              <Activity className="w-3 h-3" />
-                             <span>SYNCED & ARMED</span>
+                             <span>{opp.c1ExecutionEligible ? "SYNCED & EXEC SLOT" : "TOP-50 LISTED"}</span>
                            </div>
                            <button className="px-3 py-1 bg-cyan-500/20 hover:bg-cyan-500/40 text-cyan-100 rounded text-[9px] tracking-widest transition-colors uppercase border border-cyan-500/30">
-                             Execute Vector
+                             {opp.c1ExecutionEligible ? "Execute Vector" : "Listed Only"}
                            </button>
                         </motion.div>
                       )}
@@ -172,7 +215,7 @@ export default function HyperImmersiveOpportunities({ opportunities, diagnostics
                       <span className="text-cyan-300 font-bold">{discovery.total_pools ?? 0}</span>
                     </div>
                     <div className="border border-[#1e2025] bg-black/30 rounded px-2 py-2">
-                      <span className="block text-gray-600">Cached Spreads</span>
+                      <span className="block text-gray-600">Top Routes</span>
                       <span className="text-cyan-300 font-bold">{discovery.cached_spreads ?? 0}</span>
                     </div>
                     <div className="border border-[#1e2025] bg-black/30 rounded px-2 py-2">

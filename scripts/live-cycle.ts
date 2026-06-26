@@ -24,9 +24,28 @@ import {
   type QuotedRouteStep,
   type RouteCostsInAsset,
 } from "../server/engine/executionInvariants.js";
+  flushLaneEventBatch,
+  lockOpportunityForExecution,
+  publishOpportunitySnapshot,
+  recordLaneEvent,
+  releaseOpportunityLock,
+} from "../server/redisLedger.js";
 
 const CHAIN_ID = 137n;
 const API_BASE = process.env.APEX_API_BASE || "http://127.0.0.1:3000";
+const DEFAULT_DISCOVERY_LOOKBACK_BLOCKS = 2_500;
+const DEFAULT_DISCOVERY_LOG_CHUNK_BLOCKS = 1_000;
+const DEFAULT_CURVE_MAX_POOLS = 25;
+const DEFAULT_BALANCER_MAX_POOLS = 50;
+const DEFAULT_V3_MAX_POOLS = 75;
+const DEFAULT_ALGEBRA_MAX_POOLS = 75;
+const DEFAULT_ROUTE_MAX_CYCLES = 500;
+const DEFAULT_DISCOVERY_CONCURRENCY = 16;
+const DEFAULT_QUOTE_LANES = 32;
+const DEFAULT_RPC_CALL_TIMEOUT_MS = 8_000;
+const DEFAULT_ROUTE_MAX_STATE_AGE_BLOCKS = 128;
+const DEFAULT_TOP_ROUTE_DISPLAY_LIMIT = 50;
+const DEFAULT_C1_EXECUTABLE_LIMIT = 10;
 const AAVE_V3_POOL = process.env.AAVE_V3_POOL_ADDRESS || "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
 const DEFAULT_C1_TARGET = process.env.C1_CONTRACT_ADDRESS || process.env.CONTRACT_ADDRESS || process.env.EXECUTOR_ADDRESS || "";
 const ZERO_ADDRESS = ethers.ZeroAddress;
@@ -153,6 +172,20 @@ type Candidate = {
   netProfitUsd?: number;
   lowestPoolTvlUsd: number;
   rejectionReason: string;
+  c1ExecutionEligible?: boolean;
+  c1ExecutionSlot?: number;
+};
+
+type ReverseRouteMetadata = {
+  available: boolean;
+  error?: string;
+  reverseFlashloanSource?: number;
+  reverseFlashloanAsset?: string;
+  reverseFlashloanAmount?: string;
+  reverseContext?: any;
+  reversePath?: string;
+  reverseVenues?: string;
+  sizingRule?: string;
 };
 
 type DiscoveryStats = {
@@ -225,6 +258,34 @@ function bpsMin(amount: bigint, slippageBps: bigint) {
   return amount * keepBps / 10000n;
 }
 
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+) {
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      await worker(items[index]);
+    }
+  });
+  await Promise.all(workers);
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}_TIMEOUT_${timeoutMs}MS`)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function usdStableSeed(symbol: string) {
   const upper = symbol.toUpperCase();
   if (upper === "USDC" || upper === "USDC.E" || upper === "USDT" || upper === "DAI") return 1;
@@ -253,7 +314,7 @@ async function postJson(path: string, body: unknown) {
   const response = await fetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body, (_key, value) => typeof value === "bigint" ? value.toString() : value),
   });
   return { status: response.status, json: await response.json() };
 }
@@ -348,8 +409,8 @@ async function discoverAaveFlashloanLiquidity(provider: ethers.JsonRpcProvider, 
 
 async function discoverBalancerFlashloanLiquidity(provider: ethers.JsonRpcProvider, tokenCache: Map<string, TokenMeta>, latestBlock: number) {
   const vaultAddress = normalize(ROUTE_ADAPTER_TARGETS.balancerVault);
-  const lookback = intEnv("LIVE_BALANCER_LOOKBACK_BLOCKS", intEnv("LIVE_DISCOVERY_LOOKBACK_BLOCKS", latestBlock));
-  const chunk = Math.max(1, intEnv("LIVE_DISCOVERY_LOG_CHUNK_BLOCKS", 5));
+  const lookback = intEnv("LIVE_BALANCER_LOOKBACK_BLOCKS", intEnv("LIVE_DISCOVERY_LOOKBACK_BLOCKS", DEFAULT_DISCOVERY_LOOKBACK_BLOCKS));
+  const chunk = Math.max(1, intEnv("LIVE_DISCOVERY_LOG_CHUNK_BLOCKS", DEFAULT_DISCOVERY_LOG_CHUNK_BLOCKS));
   const fromBlock = Math.max(0, latestBlock - lookback);
   const iface = new ethers.Interface(BALANCER_VAULT_ABI);
   const topic = iface.getEvent("PoolRegistered")?.topicHash;
@@ -559,8 +620,8 @@ async function discoverV2(provider: ethers.JsonRpcProvider, tokenCache: Map<stri
     "LIVE_DISCOVERY_V2_FACTORIES",
     "QuickSwapV2:0x5757371414417b8c6caad45baef941abc7d3ab32:0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff:30;SushiSwapV2:0xc35DADB65012eC5796536bD9864eD8773aBc74C4:0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506:30",
   );
-  const lookback = intEnv("LIVE_DISCOVERY_LOOKBACK_BLOCKS", latestBlock);
-  const chunk = Math.max(1, intEnv("LIVE_DISCOVERY_LOG_CHUNK_BLOCKS", 5));
+  const lookback = intEnv("LIVE_DISCOVERY_LOOKBACK_BLOCKS", DEFAULT_DISCOVERY_LOOKBACK_BLOCKS);
+  const chunk = Math.max(1, intEnv("LIVE_DISCOVERY_LOG_CHUNK_BLOCKS", DEFAULT_DISCOVERY_LOG_CHUNK_BLOCKS));
   const fromBlock = Math.max(0, latestBlock - lookback);
   const iface = new ethers.Interface(V2_FACTORY_ABI);
   const topic = iface.getEvent("PairCreated")?.topicHash;
@@ -586,18 +647,22 @@ async function discoverV2(provider: ethers.JsonRpcProvider, tokenCache: Map<stri
       }
     }
 
+    const assetPairs: Array<[TokenMeta, TokenMeta]> = [];
     for (let i = 0; i < flashloanAssets.length; i += 1) {
       for (let j = i + 1; j < flashloanAssets.length; j += 1) {
+        assetPairs.push([flashloanAssets[i], flashloanAssets[j]]);
+      }
+    }
+    await runWithConcurrency(assetPairs, intEnv("LIVE_DISCOVERY_CONCURRENCY", DEFAULT_DISCOVERY_CONCURRENCY), async ([left, right]) => {
         try {
-          const pair = normalize(await factory.getPair(flashloanAssets[i].address, flashloanAssets[j].address));
-          if (pair === ZERO_ADDRESS || seen.has(pair.toLowerCase()) || await provider.getCode(pair) === "0x") continue;
+          const pair = normalize(await factory.getPair(left.address, right.address));
+          if (pair === ZERO_ADDRESS || seen.has(pair.toLowerCase())) return;
           seen.add(pair.toLowerCase());
           await addV2Pair(provider, tokenCache, edges, stats, venueName, dexId, router, pair, Number(feeRaw || 30), latestBlock);
         } catch {
           stats.rejectedMetadata += 1;
         }
-      }
-    }
+    });
   }
 }
 
@@ -655,8 +720,8 @@ async function discoverV3(provider: ethers.JsonRpcProvider, tokenCache: Map<stri
     "LIVE_DISCOVERY_V3_FACTORIES",
     `UniswapV3:0x1F98431c8aD98523631AE4a59f267346ea31F984:${ROUTE_ADAPTER_TARGETS.uniswapV3Router}:${ROUTE_ADAPTER_TARGETS.uniswapV3Quoter}:100,500,3000,10000`,
   );
-  const lookback = intEnv("LIVE_DISCOVERY_LOOKBACK_BLOCKS", latestBlock);
-  const chunk = Math.max(1, intEnv("LIVE_DISCOVERY_LOG_CHUNK_BLOCKS", 5));
+  const lookback = intEnv("LIVE_DISCOVERY_LOOKBACK_BLOCKS", DEFAULT_DISCOVERY_LOOKBACK_BLOCKS);
+  const chunk = Math.max(1, intEnv("LIVE_DISCOVERY_LOG_CHUNK_BLOCKS", DEFAULT_DISCOVERY_LOG_CHUNK_BLOCKS));
   const fromBlock = Math.max(0, latestBlock - lookback);
   const iface = new ethers.Interface(V3_FACTORY_ABI);
   const topic = iface.getEvent("PoolCreated")?.topicHash;
@@ -666,37 +731,58 @@ async function discoverV3(provider: ethers.JsonRpcProvider, tokenCache: Map<stri
     const dexId = venueName.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
     const factory = new ethers.Contract(factoryAddress, V3_FACTORY_ABI, provider);
     const seen = new Set<string>();
+    const maxPools = intEnv("LIVE_V3_MAX_POOLS", DEFAULT_V3_MAX_POOLS);
+    const callTimeoutMs = intEnv("LIVE_RPC_CALL_TIMEOUT_MS", DEFAULT_RPC_CALL_TIMEOUT_MS);
     const scan = topic
       ? await safeGetLogs(provider, { address: normalize(factoryAddress), topics: [topic] }, fromBlock, latestBlock, chunk)
       : { logs: [], rejected: 0 };
     stats.rejectedLogScan += scan.rejected;
     for (const log of scan.logs) {
+      if (seen.size >= maxPools) break;
       try {
         const parsed = iface.parseLog(log);
         const pool = normalize(parsed?.args?.pool);
         if (seen.has(pool.toLowerCase())) continue;
         seen.add(pool.toLowerCase());
-        await addV3Pool(provider, tokenCache, edges, stats, venueName, dexId, router, pool, Number(parsed?.args?.fee), latestBlock);
+        await withTimeout(
+          addV3Pool(provider, tokenCache, edges, stats, venueName, dexId, router, pool, Number(parsed?.args?.fee), latestBlock),
+          callTimeoutMs * 2,
+          "V3_ADD_POOL",
+        );
       } catch {
         stats.rejectedMetadata += 1;
       }
     }
 
     const fees = (feeListRaw || "100,500,3000,10000").split(",").map((fee) => Number(fee.trim())).filter(Number.isFinite);
+    const poolQueries: Array<[TokenMeta, TokenMeta, number]> = [];
     for (let i = 0; i < flashloanAssets.length; i += 1) {
       for (let j = i + 1; j < flashloanAssets.length; j += 1) {
         for (const fee of fees) {
-          try {
-            const pool = normalize(await factory.getPool(flashloanAssets[i].address, flashloanAssets[j].address, fee));
-            if (pool === ZERO_ADDRESS || seen.has(pool.toLowerCase()) || await provider.getCode(pool) === "0x") continue;
-            seen.add(pool.toLowerCase());
-            await addV3Pool(provider, tokenCache, edges, stats, venueName, dexId, router, pool, fee, latestBlock);
-          } catch {
-            stats.rejectedMetadata += 1;
-          }
+          poolQueries.push([flashloanAssets[i], flashloanAssets[j], fee]);
         }
       }
     }
+    await runWithConcurrency(poolQueries, intEnv("LIVE_DISCOVERY_CONCURRENCY", DEFAULT_DISCOVERY_CONCURRENCY), async ([left, right, fee]) => {
+          if (seen.size >= maxPools) return;
+          try {
+            const pool = normalize(await withTimeout(
+              factory.getPool(left.address, right.address, fee) as Promise<string>,
+              callTimeoutMs,
+              "V3_GET_POOL",
+            ));
+            if (pool === ZERO_ADDRESS || seen.has(pool.toLowerCase())) return;
+            if (seen.size >= maxPools) return;
+            seen.add(pool.toLowerCase());
+            await withTimeout(
+              addV3Pool(provider, tokenCache, edges, stats, venueName, dexId, router, pool, fee, latestBlock),
+              callTimeoutMs * 2,
+              "V3_ADD_POOL",
+            );
+          } catch {
+            stats.rejectedMetadata += 1;
+          }
+    });
   }
 }
 
@@ -751,8 +837,8 @@ async function discoverAlgebra(provider: ethers.JsonRpcProvider, tokenCache: Map
     "LIVE_DISCOVERY_ALGEBRA_FACTORIES",
     `QuickSwapAlgebra:${ROUTE_ADAPTER_TARGETS.algebraFactory}:${ROUTE_ADAPTER_TARGETS.algebraRouter}:${ROUTE_ADAPTER_TARGETS.algebraQuoter}`,
   );
-  const lookback = intEnv("LIVE_DISCOVERY_LOOKBACK_BLOCKS", latestBlock);
-  const chunk = Math.max(1, intEnv("LIVE_DISCOVERY_LOG_CHUNK_BLOCKS", 5));
+  const lookback = intEnv("LIVE_DISCOVERY_LOOKBACK_BLOCKS", DEFAULT_DISCOVERY_LOOKBACK_BLOCKS);
+  const chunk = Math.max(1, intEnv("LIVE_DISCOVERY_LOG_CHUNK_BLOCKS", DEFAULT_DISCOVERY_LOG_CHUNK_BLOCKS));
   const fromBlock = Math.max(0, latestBlock - lookback);
   const iface = new ethers.Interface(ALGEBRA_FACTORY_ABI);
   const topic = iface.getEvent("Pool")?.topicHash;
@@ -762,39 +848,60 @@ async function discoverAlgebra(provider: ethers.JsonRpcProvider, tokenCache: Map
     const dexId = venueName.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
     const factory = new ethers.Contract(factoryAddress, ALGEBRA_FACTORY_ABI, provider);
     const seen = new Set<string>();
+    const maxPools = intEnv("LIVE_ALGEBRA_MAX_POOLS", DEFAULT_ALGEBRA_MAX_POOLS);
+    const callTimeoutMs = intEnv("LIVE_RPC_CALL_TIMEOUT_MS", DEFAULT_RPC_CALL_TIMEOUT_MS);
     const scan = topic
       ? await safeGetLogs(provider, { address: normalize(factoryAddress), topics: [topic] }, fromBlock, latestBlock, chunk)
       : { logs: [], rejected: 0 };
     stats.rejectedLogScan += scan.rejected;
     for (const log of scan.logs) {
+      if (seen.size >= maxPools) break;
       try {
         const parsed = iface.parseLog(log);
         const pool = normalize(parsed?.args?.pool);
         if (seen.has(pool.toLowerCase())) continue;
         seen.add(pool.toLowerCase());
-        await addAlgebraPool(provider, tokenCache, edges, stats, venueName, dexId, router, pool, latestBlock);
+        await withTimeout(
+          addAlgebraPool(provider, tokenCache, edges, stats, venueName, dexId, router, pool, latestBlock),
+          callTimeoutMs * 2,
+          "ALGEBRA_ADD_POOL",
+        );
       } catch {
         stats.rejectedMetadata += 1;
       }
     }
+    const assetPairs: Array<[TokenMeta, TokenMeta]> = [];
     for (let i = 0; i < flashloanAssets.length; i += 1) {
       for (let j = i + 1; j < flashloanAssets.length; j += 1) {
+        assetPairs.push([flashloanAssets[i], flashloanAssets[j]]);
+      }
+    }
+    await runWithConcurrency(assetPairs, intEnv("LIVE_DISCOVERY_CONCURRENCY", DEFAULT_DISCOVERY_CONCURRENCY), async ([left, right]) => {
+        if (seen.size >= maxPools) return;
         try {
-          const pool = normalize(await factory.poolByPair(flashloanAssets[i].address, flashloanAssets[j].address));
-          if (pool === ZERO_ADDRESS || seen.has(pool.toLowerCase()) || await provider.getCode(pool) === "0x") continue;
+          const pool = normalize(await withTimeout(
+            factory.poolByPair(left.address, right.address) as Promise<string>,
+            callTimeoutMs,
+            "ALGEBRA_POOL_BY_PAIR",
+          ));
+          if (pool === ZERO_ADDRESS || seen.has(pool.toLowerCase())) return;
+          if (seen.size >= maxPools) return;
           seen.add(pool.toLowerCase());
-          await addAlgebraPool(provider, tokenCache, edges, stats, venueName, dexId, router, pool, latestBlock);
+          await withTimeout(
+            addAlgebraPool(provider, tokenCache, edges, stats, venueName, dexId, router, pool, latestBlock),
+            callTimeoutMs * 2,
+            "ALGEBRA_ADD_POOL",
+          );
         } catch {
           stats.rejectedMetadata += 1;
         }
-      }
-    }
+    });
   }
 }
 
 async function discoverCurve(provider: ethers.JsonRpcProvider, tokenCache: Map<string, TokenMeta>, edges: Map<string, Edge>, stats: DiscoveryStats, latestBlock: number) {
   const addressProvider = process.env.CURVE_ADDRESS_PROVIDER || "0x0000000022D53366457F9d5E68Ec105046FC4383";
-  const maxPools = optionalIntEnv("LIVE_CURVE_MAX_POOLS");
+  const maxPools = intEnv("LIVE_CURVE_MAX_POOLS", DEFAULT_CURVE_MAX_POOLS);
   try {
     const providerContract = new ethers.Contract(addressProvider, CURVE_ADDRESS_PROVIDER_ABI, provider);
     const registryAddress = process.env.CURVE_REGISTRY || await providerContract.get_registry();
@@ -852,9 +959,9 @@ async function discoverCurve(provider: ethers.JsonRpcProvider, tokenCache: Map<s
 
 async function discoverBalancer(provider: ethers.JsonRpcProvider, tokenCache: Map<string, TokenMeta>, edges: Map<string, Edge>, stats: DiscoveryStats, latestBlock: number) {
   const vaultAddress = ROUTE_ADAPTER_TARGETS.balancerVault;
-  const lookback = intEnv("LIVE_BALANCER_LOOKBACK_BLOCKS", intEnv("LIVE_DISCOVERY_LOOKBACK_BLOCKS", latestBlock));
-  const chunk = Math.max(1, intEnv("LIVE_DISCOVERY_LOG_CHUNK_BLOCKS", 5));
-  const maxPools = optionalIntEnv("LIVE_BALANCER_MAX_POOLS");
+  const lookback = intEnv("LIVE_BALANCER_LOOKBACK_BLOCKS", intEnv("LIVE_DISCOVERY_LOOKBACK_BLOCKS", DEFAULT_DISCOVERY_LOOKBACK_BLOCKS));
+  const chunk = Math.max(1, intEnv("LIVE_DISCOVERY_LOG_CHUNK_BLOCKS", DEFAULT_DISCOVERY_LOG_CHUNK_BLOCKS));
+  const maxPools = intEnv("LIVE_BALANCER_MAX_POOLS", DEFAULT_BALANCER_MAX_POOLS);
   const fromBlock = Math.max(0, latestBlock - lookback);
   const iface = new ethers.Interface(BALANCER_VAULT_ABI);
   const topic = iface.getEvent("PoolRegistered")?.topicHash;
@@ -956,6 +1063,7 @@ async function derivePrices(provider: ethers.JsonRpcProvider, tokenCache: Map<st
 }
 
 async function discoverGraph(provider: ethers.JsonRpcProvider) {
+  console.log("LIVE_CYCLE_PHASE|phase=DISCOVERY_GRAPH_START");
   const latestBlock = await provider.getBlockNumber();
   const tokenCache = new Map<string, TokenMeta>();
   const stats: DiscoveryStats = {
@@ -978,6 +1086,7 @@ async function discoverGraph(provider: ethers.JsonRpcProvider) {
     truncated: false,
     sourceCounts: {},
   };
+  console.log(`LIVE_CYCLE_PHASE|phase=FLASHLOAN_LIQUIDITY_START|block=${latestBlock}`);
   const flashloanBook = await discoverFlashloanLiquidity(provider, tokenCache, latestBlock);
   const flashloanAssets = Array.from(new Map(flashloanBook.ordered.map((item) => [item.asset.address.toLowerCase(), item.asset])).values());
   stats.flashloanAssets = flashloanAssets.length;
@@ -985,16 +1094,28 @@ async function discoverGraph(provider: ethers.JsonRpcProvider) {
   stats.flashloanAaveAssets = flashloanBook.aave.length;
   const edges = new Map<string, Edge>();
 
+  console.log(`LIVE_CYCLE_PHASE|phase=V2_DISCOVERY_START|flashloanAssets=${flashloanAssets.length}`);
   await discoverV2(provider, tokenCache, edges, stats, latestBlock, flashloanAssets);
+  console.log(`LIVE_CYCLE_PHASE|phase=V2_DISCOVERY_END|edges=${edges.size}`);
+  console.log("LIVE_CYCLE_PHASE|phase=V3_DISCOVERY_START");
   await discoverV3(provider, tokenCache, edges, stats, latestBlock, flashloanAssets);
+  console.log(`LIVE_CYCLE_PHASE|phase=V3_DISCOVERY_END|edges=${edges.size}`);
+  console.log("LIVE_CYCLE_PHASE|phase=ALGEBRA_DISCOVERY_START");
   await discoverAlgebra(provider, tokenCache, edges, stats, latestBlock, flashloanAssets);
+  console.log(`LIVE_CYCLE_PHASE|phase=ALGEBRA_DISCOVERY_END|edges=${edges.size}`);
+  console.log("LIVE_CYCLE_PHASE|phase=CURVE_DISCOVERY_START");
   await discoverCurve(provider, tokenCache, edges, stats, latestBlock);
+  console.log(`LIVE_CYCLE_PHASE|phase=CURVE_DISCOVERY_END|edges=${edges.size}`);
+  console.log("LIVE_CYCLE_PHASE|phase=BALANCER_DISCOVERY_START");
   await discoverBalancer(provider, tokenCache, edges, stats, latestBlock);
+  console.log(`LIVE_CYCLE_PHASE|phase=BALANCER_DISCOVERY_END|edges=${edges.size}`);
 
   const edgeList = Array.from(edges.values());
+  console.log(`LIVE_CYCLE_PHASE|phase=PRICE_DERIVATION_START|edges=${edgeList.length}`);
   await derivePrices(provider, tokenCache, edgeList);
-  const maxStateAgeBlocks = intEnv("LIVE_ROUTE_MAX_STATE_AGE_BLOCKS", 3);
+  const maxStateAgeBlocks = intEnv("LIVE_ROUTE_MAX_STATE_AGE_BLOCKS", DEFAULT_ROUTE_MAX_STATE_AGE_BLOCKS);
   const liveEdges: Edge[] = [];
+  console.log(`LIVE_CYCLE_PHASE|phase=PRESEND_REVALIDATION_START|edges=${edgeList.length}`);
   for (const edge of edgeList) {
     const result = await preSendRevalidate(provider, edge, maxStateAgeBlocks).catch((error) => ({ ok: false, error: error?.message }));
     if (!result.ok) {
@@ -1006,6 +1127,7 @@ async function discoverGraph(provider: ethers.JsonRpcProvider) {
   stats.tokens = tokenCache.size;
   stats.discoveredEdges = liveEdges.length;
   stats.discoveredPools = new Set(liveEdges.map((edge) => edge.poolAddress.toLowerCase())).size;
+  console.log(`LIVE_CYCLE_PHASE|phase=DISCOVERY_GRAPH_END|liveEdges=${liveEdges.length}|tokens=${tokenCache.size}`);
   return { latestBlock, tokenCache, flashloanAssets, flashloanBook, edges: liveEdges, stats };
 }
 
@@ -1122,6 +1244,32 @@ function buildStepCalldata(edge: Edge, amountIn: bigint, minAmountOut: bigint, t
   throw new Error(`CALldata_UNSUPPORTED_INVARIANT:${edge.invariant}`);
 }
 
+function reverseEdge(edge: Edge): Edge {
+  const extra = edge.extra ? { ...edge.extra } : undefined;
+  if (extra?.balancerWeightIn !== undefined || extra?.balancerWeightOut !== undefined) {
+    const weightIn = extra.balancerWeightIn;
+    extra.balancerWeightIn = extra.balancerWeightOut;
+    extra.balancerWeightOut = weightIn;
+  }
+  return {
+    ...edge,
+    edgeId: `${edge.dexId}:${edge.poolAddress}:${edge.tokenOutSymbol}->${edge.tokenInSymbol}:reverse`,
+    tokenIn: edge.tokenOut,
+    tokenOut: edge.tokenIn,
+    tokenInIndex: edge.tokenOutIndex,
+    tokenOutIndex: edge.tokenInIndex,
+    tokenInDecimals: edge.tokenOutDecimals,
+    tokenOutDecimals: edge.tokenInDecimals,
+    tokenInSymbol: edge.tokenOutSymbol,
+    tokenOutSymbol: edge.tokenInSymbol,
+    tokenInPriceUsd: edge.tokenOutPriceUsd,
+    tokenOutPriceUsd: edge.tokenInPriceUsd,
+    reserveIn: edge.reserveOut,
+    reserveOut: edge.reserveIn,
+    extra,
+  };
+}
+
 function buildAdjacency(edges: Edge[]) {
   const byIn = new Map<string, Edge[]>();
   for (const edge of edges) {
@@ -1136,7 +1284,7 @@ function buildAdjacency(edges: Edge[]) {
 function enumerateCycles(flashloanAssets: TokenMeta[], edges: Edge[], stats: DiscoveryStats) {
   const byIn = buildAdjacency(edges);
   const maxHops = Math.max(2, Math.min(4, intEnv("MAX_ROUTE_HOPS", 4)));
-  const maxCycles = optionalIntEnv("LIVE_ROUTE_MAX_CYCLES");
+  const maxCycles = intEnv("LIVE_ROUTE_MAX_CYCLES", DEFAULT_ROUTE_MAX_CYCLES);
   const cycles: Edge[][] = [];
   const flashSet = new Set(flashloanAssets.map((asset) => asset.address.toLowerCase()));
 
@@ -1184,6 +1332,7 @@ async function quoteCandidate(
   gasCostUsd: number,
   bribesUsd: number,
   minProfitUsd: number,
+  laneId = 0,
 ) {
   const flashloanAsset = tokenCache.get(route[0].tokenIn.toLowerCase());
   if (!flashloanAsset) throw new Error("FLASHLOAN_TOKEN_METADATA_MISSING");
@@ -1203,13 +1352,34 @@ async function quoteCandidate(
 
   let amount = amountIn;
   const steps: RouteQuoteStep[] = [];
-  for (const edge of route) {
+  for (let legIndex = 0; legIndex < route.length; legIndex += 1) {
+    const edge = route[legIndex];
+    const team = legIndex === 0 ? "LEG1_MATH" : "LEG2_PLUS_MATH";
+    void recordLaneEvent({
+      laneId,
+      team,
+      phase: "QUOTE_START",
+      legIndex,
+      invariant: edge.invariant,
+      poolAddress: edge.poolAddress,
+      tokenIn: edge.tokenInSymbol,
+      tokenOut: edge.tokenOutSymbol,
+      at: Date.now(),
+    });
     const amountOut = await quoteEdge(provider, edge, amount);
     if (amountOut <= 0n) throw new Error("QUOTE_ZERO_OUTPUT");
     const minAmountOut = bpsMin(amountOut, slippageBps);
     const calldata = buildStepCalldata(edge, amount, minAmountOut, targetContract, deadline);
     steps.push({ edge, amountIn: amount, amountOut, minAmountOut, calldata });
     amount = amountOut;
+    void recordLaneEvent({
+      laneId,
+      team,
+      phase: "QUOTE_END",
+      legIndex,
+      amountOut,
+      at: Date.now(),
+    });
   }
 
   const amountOut = amount;
@@ -1302,26 +1472,146 @@ async function rankCandidates(provider: ethers.JsonRpcProvider, tokenCache: Map<
     : Number(bribesWei) / 1e18 * nativeUsd;
   const minProfitUsd = numberEnv("MIN_NET_PROFIT_USD", 5);
   const candidates: Candidate[] = [];
+  const quoteLanes = intEnv("LIVE_QUOTE_LANES", DEFAULT_QUOTE_LANES);
+  const leg1Helpers = Math.max(1, Math.floor(quoteLanes / 2));
+  const leg2Helpers = Math.max(1, quoteLanes - leg1Helpers);
+  console.log(`LANE_TEAM_SUMMARY|quoteLanes=${quoteLanes}|leg1Helpers=${leg1Helpers}|leg2PlusHelpers=${leg2Helpers}|cycles=${cycles.length}|dependency=LEG2_REQUIRES_LEG1_OUTPUT`);
 
-  for (const route of cycles) {
+  await runWithConcurrency(cycles.map((route, index) => ({ route, index })), quoteLanes, async ({ route, index }) => {
     try {
       candidates.push(await quoteCandidate(provider, tokenCache, flashloanBook, route, targetContract, gasCostUsd, bribesUsd, minProfitUsd));
+      const laneId = index % quoteLanes;
+      candidates.push(await quoteCandidate(provider, tokenCache, flashloanBook, route, targetContract, gasCostUsd, minProfitUsd, laneId));
     } catch {
       stats.routeCyclesRejectedQuote += 1;
     }
-  }
+  });
 
   candidates.sort((a, b) => (b.netProfitUsd ?? Number.NEGATIVE_INFINITY) - (a.netProfitUsd ?? Number.NEGATIVE_INFINITY));
+  let executableSlot = 0;
   candidates.forEach((candidate, index) => {
     candidate.rank = index + 1;
     candidate.routeId = `LIVE-${String(index + 1).padStart(6, "0")}`;
+    if (candidate.status === "EXECUTABLE_PROFIT_CANDIDATE" && executableSlot < intEnv("C1_EXECUTABLE_LIMIT_PER_CYCLE", DEFAULT_C1_EXECUTABLE_LIMIT)) {
+      executableSlot += 1;
+      candidate.c1ExecutionEligible = true;
+      candidate.c1ExecutionSlot = executableSlot;
+    } else {
+      candidate.c1ExecutionEligible = false;
+    }
   });
   return { candidates, gasCostUsd, bribesUsd, minProfitUsd };
+  const topRouteDisplayLimit = intEnv("TOP_ROUTE_DISPLAY_LIMIT", DEFAULT_TOP_ROUTE_DISPLAY_LIMIT);
+  await publishOpportunitySnapshot(candidates.slice(0, topRouteDisplayLimit).map(candidateToLedgerPayload), "live-cycle-rank-candidates");
+  return { candidates, gasCostUsd, minProfitUsd };
+}
+
+function candidateToLedgerPayload(candidate: Candidate) {
+  return {
+    routeId: candidate.routeId,
+    payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
+    status: candidate.status,
+    c1ExecutionEligible: Boolean(candidate.c1ExecutionEligible),
+    c1ExecutionSlot: candidate.c1ExecutionSlot,
+    pair: `${candidate.flashloanAsset.symbol} cycle`,
+    path: routePath(candidate),
+    venues: routeVenues(candidate),
+    hops: candidate.steps.length,
+    flashloanAsset: candidate.flashloanAsset.address,
+    flashloanSymbol: candidate.flashloanAsset.symbol,
+    flashloanProvider: candidate.flashloanLiquidity.provider,
+    flashloanSource: candidate.flashloanLiquidity.sourceCode,
+    amountIn: candidate.amountIn,
+    amountOut: candidate.amountOut,
+    grossProfitUsd: candidate.grossProfitUsd,
+    flashFeeUsd: candidate.flashFeeUsd,
+    gasCostUsd: candidate.gasCostUsd,
+    netProfitUsd: candidate.netProfitUsd,
+    profit_usd: candidate.netProfitUsd,
+    lowestPoolTvlUsd: candidate.lowestPoolTvlUsd,
+    pools: candidate.steps.map((step) => step.edge.poolAddress),
+    reason: candidate.rejectionReason,
+    chain_id: 137,
+    executionReady: Boolean(candidate.c1ExecutionEligible),
+    c1ExecutableLimitPerCycle: intEnv("C1_EXECUTABLE_LIMIT_PER_CYCLE", DEFAULT_C1_EXECUTABLE_LIMIT),
+  };
+}
+
+async function buildReverseRouteMetadata(
+  provider: ethers.JsonRpcProvider,
+  candidate: Candidate,
+  targetContract: string,
+  c1Nonce: bigint,
+): Promise<ReverseRouteMetadata> {
+  try {
+    if (!candidate.flashloanAsset.priceUsd) throw new Error("REVERSE_FLASHLOAN_ASSET_PRICE_MISSING");
+    const lowestPoolTvlUsd = Math.min(...candidate.steps.map((step) => step.edge.tvlUsd).filter((value) => Number.isFinite(value) && value > 0));
+    if (!Number.isFinite(lowestPoolTvlUsd) || lowestPoolTvlUsd <= 0) throw new Error("REVERSE_LOWEST_POOL_TVL_UNRESOLVED");
+
+    const targetAmountIn = floatToRaw(
+      (lowestPoolTvlUsd * numberEnv("SIM_MAX_FLASH_TVL_FRACTION", 0.15)) / candidate.flashloanAsset.priceUsd,
+      candidate.flashloanAsset.decimals,
+    );
+    const reverseFlashloanAmount = targetAmountIn <= candidate.flashloanLiquidity.liquidity
+      ? targetAmountIn
+      : candidate.flashloanLiquidity.liquidity;
+    if (reverseFlashloanAmount <= 0n) throw new Error("REVERSE_FLASHLOAN_SIZE_ZERO");
+
+    const slippageBps = BigInt(Math.floor(numberEnv("SLIPPAGE_BPS", 10)));
+    const deadline = Math.floor(Date.now() / 1000) + intEnv("EXECUTION_SUBMISSION_EXPIRY_SECONDS", 300);
+    const reverseSteps: RouteQuoteStep[] = [];
+    let amount = reverseFlashloanAmount;
+    for (const reverse of [...candidate.steps].reverse().map((step) => reverseEdge(step.edge))) {
+      const amountOut = await quoteEdge(provider, reverse, amount);
+      if (amountOut <= 0n) throw new Error("REVERSE_QUOTE_ZERO_OUTPUT");
+      const minAmountOut = bpsMin(amountOut, slippageBps);
+      const calldata = buildStepCalldata(reverse, amount, minAmountOut, targetContract, deadline);
+      reverseSteps.push({ edge: reverse, amountIn: amount, amountOut, minAmountOut, calldata });
+      amount = amountOut;
+    }
+
+    const flashFeeRaw = reverseFlashloanAmount * candidate.flashloanLiquidity.feeBps / 10000n;
+    const reverseContext = {
+      profitAsset: candidate.flashloanAsset.address,
+      minNetProfit: flashFeeRaw + 1n,
+      nonce: c1Nonce + 1n,
+      merkleRoot: ethers.ZeroHash,
+      proof: [],
+      steps: reverseSteps.map((step) => ({
+        venue: step.edge.executorTarget,
+        tokenIn: step.edge.tokenIn,
+        tokenOut: step.edge.tokenOut,
+        amountIn: step.amountIn,
+        minAmountOut: step.minAmountOut,
+        callValue: 0n,
+        payload: step.calldata,
+      })),
+    };
+
+    const reversePathSymbols = reverseSteps.map((step) => step.edge.tokenInSymbol);
+    reversePathSymbols.push(reverseSteps[reverseSteps.length - 1]?.edge.tokenOutSymbol || candidate.flashloanAsset.symbol);
+    return {
+      available: true,
+      reverseFlashloanSource: candidate.flashloanLiquidity.sourceCode,
+      reverseFlashloanAsset: candidate.flashloanAsset.address,
+      reverseFlashloanAmount: reverseFlashloanAmount.toString(),
+      reverseContext,
+      reversePath: reversePathSymbols.join("->"),
+      reverseVenues: reverseSteps.map((step) => `${step.edge.venueName}:${step.edge.invariant}`).join("->"),
+      sizingRule: "REVERSE_FLASHLOAN_SIZE=min(15% x lowest route TVL, provider liquidity)",
+    };
+  } catch (error: any) {
+    return {
+      available: false,
+      error: error?.message || "REVERSE_ROUTE_METADATA_BUILD_FAILED",
+    };
+  }
 }
 
 async function buildC1Context(provider: ethers.JsonRpcProvider, candidate: Candidate, targetContract: string) {
   const vm = new ethers.Contract(targetContract, VM_ABI, provider);
   const nonce = await vm.globalNonce().catch(() => 0n);
+  const reverseRouteMetadata = await buildReverseRouteMetadata(provider, candidate, targetContract, BigInt(nonce));
   return {
     profitAsset: candidate.flashloanAsset.address,
     minNetProfit: candidate.flashFeeRaw + 1n,
@@ -1337,6 +1627,14 @@ async function buildC1Context(provider: ethers.JsonRpcProvider, candidate: Candi
       callValue: 0n,
       payload: step.calldata,
     })),
+    routeMetadata: {
+      routeId: candidate.routeId,
+      mirrorPath: routePath(candidate),
+      mirrorVenues: routeVenues(candidate),
+      mirrorFlashloanAmount: candidate.amountIn.toString(),
+      reverseAutomation: reverseRouteMetadata.available ? "READY" : "UNAVAILABLE",
+      ...reverseRouteMetadata,
+    },
   };
 }
 
@@ -1351,16 +1649,21 @@ function routeVenues(candidate: Candidate) {
 }
 
 async function main() {
+  console.log("LIVE_CYCLE_PHASE|phase=BOOT_START");
   const provider = new ethers.JsonRpcProvider(rpcUrl(), Number(CHAIN_ID), { staticNetwork: true });
   const network = await provider.getNetwork();
   if (network.chainId !== CHAIN_ID) throw new Error(`CHAIN_ID_MISMATCH:${network.chainId}`);
   const targetContract = DEFAULT_C1_TARGET ? normalize(DEFAULT_C1_TARGET) : "";
   if (!targetContract) throw new Error("C1_TARGET_MISSING");
 
+  console.log("LIVE_CYCLE_PHASE|phase=API_PREFLIGHT_START");
   const health = await getJson("/api/system/healthz").catch((error) => ({ success: false, error: error.message }));
   const readiness = await getJson("/api/system/readiness").catch((error) => ({ ready: false, error: error.message }));
+  console.log(`LIVE_CYCLE_PHASE|phase=API_PREFLIGHT_END|health=${health.status || health.success}|readiness=${readiness.status || readiness.ready}`);
   const { latestBlock, tokenCache, flashloanAssets, flashloanBook, edges, stats } = await discoverGraph(provider);
   const { candidates, gasCostUsd, bribesUsd, minProfitUsd } = await rankCandidates(provider, tokenCache, flashloanBook.byAsset, flashloanAssets, edges, stats, targetContract);
+  console.log(`LIVE_CYCLE_PHASE|phase=RANKING_START|edges=${edges.length}|flashloanAssets=${flashloanAssets.length}`);
+  const { candidates, gasCostUsd, minProfitUsd } = await rankCandidates(provider, tokenCache, flashloanBook.byAsset, flashloanAssets, edges, stats, targetContract);
   const maxPrint = optionalIntEnv("LIVE_ROUTE_PRINT_LIMIT");
 
   console.log(`LIVE_CYCLE_START|chainId=${network.chainId}|block=${latestBlock}|api=${API_BASE}|serverHealth=${health.status || health.success}|serverReady=${readiness.status || readiness.ready}|broadcastPolicy=ONLY_AFTER_ALL_INVARIANTS_PASS|routeMode=FULL_DYNAMIC_OMNI_DIRECTIONAL|venueMode=VENUE_AGNOSTIC|directionMode=DIRECTION_AGNOSTIC|assetMode=BALANCER_FIRST_AAVE_FALLBACK_FLASHLOAN_LIQUIDITY|pnlUpdated=false`);
@@ -1369,11 +1672,16 @@ async function main() {
   console.log(`FLASHLOAN_ASSETS|${flashloanAssets.map((asset) => `${asset.symbol}:${asset.address}`).join(",")}`);
   console.log(`PRICE_MAP|${JSON.stringify(Object.fromEntries(Array.from(tokenCache.values()).filter((token) => token.priceUsd).map((token) => [token.symbol, Number(token.priceUsd?.toFixed(8))])))}`);
 
-  for (const candidate of maxPrint === undefined ? candidates : candidates.slice(0, maxPrint)) {
+  const topRouteDisplayLimit = intEnv("TOP_ROUTE_DISPLAY_LIMIT", DEFAULT_TOP_ROUTE_DISPLAY_LIMIT);
+  console.log(`ROUTE_LIMITS|totalRoutes=${candidates.length}|topRouteDisplayLimit=${topRouteDisplayLimit}|c1ExecutableLimitPerCycle=${intEnv("C1_EXECUTABLE_LIMIT_PER_CYCLE", DEFAULT_C1_EXECUTABLE_LIMIT)}|c2DecisionLimitPerCycle=${Number(process.env.C2_DECISION_LIMIT_PER_CYCLE || 50)}`);
+
+  for (const candidate of maxPrint === undefined ? candidates.slice(0, topRouteDisplayLimit) : candidates.slice(0, Math.min(maxPrint, topRouteDisplayLimit))) {
     console.log([
       `ROUTE_RANK|rank=${candidate.rank}`,
       `routeId=${candidate.routeId}`,
       `status=${candidate.status}`,
+      `c1ExecutionEligible=${Boolean(candidate.c1ExecutionEligible)}`,
+      `c1ExecutionSlot=${candidate.c1ExecutionSlot ?? "NONE"}`,
       `flashloanAsset=${candidate.flashloanAsset.symbol}:${candidate.flashloanAsset.address}`,
       `flashloanProvider=${candidate.flashloanLiquidity.provider}`,
       `flashloanProviderAddress=${candidate.flashloanLiquidity.providerAddress}`,
@@ -1393,30 +1701,47 @@ async function main() {
     ].join("|"));
   }
 
-  const best = candidates[0];
+  const best = candidates.find((candidate) => candidate.c1ExecutionEligible) || candidates[0];
   if (!best) {
     console.log("OPPORTUNITY_DECISION|decision=DO_NOTHING|reason=NO_DYNAMIC_ROUTE_CANDIDATES|hash=NONE|pnlUpdated=false");
   } else if (best.status !== "EXECUTABLE_PROFIT_CANDIDATE") {
     console.log(`OPPORTUNITY_DECISION|decision=DO_NOTHING|bestRoute=${best.routeId}|reason=${best.rejectionReason}|hash=NONE|pnlUpdated=false`);
   } else {
+    const ledgerPayload = candidateToLedgerPayload(best);
+    const lock = await lockOpportunityForExecution(ledgerPayload);
+    if (!lock.ok) {
+      console.log(`OPPORTUNITY_DECISION|decision=DO_NOTHING|bestRoute=${best.routeId}|reason=${lock.reason}|redisId=${lock.id}|hash=NONE|pnlUpdated=false`);
+      console.log("C2_DECISION|decision=DO_NOTHING|reason=NO_CONFIRMED_C1_HASH_IN_THIS_CYCLE|hash=NONE|pnlUpdated=false");
+      return;
+    }
     const context = await buildC1Context(provider, best, targetContract);
     const exec = await postJson("/api/execution/c1", {
+      redisId: lock.id,
       targetContract,
       flashloanSource: best.flashloanLiquidity.sourceCode,
       flashloanAsset: best.flashloanAsset.address,
       flashloanAmount: best.amountIn,
       context,
     });
+    if (!exec.json.success) {
+      await releaseOpportunityLock(lock.id, "C1_REJECTED", {
+        routeId: best.routeId,
+        error: exec.json.error || "C1 rejected by API",
+      });
+    }
     console.log(`C1_EXECUTION_RESULT|routeId=${best.routeId}|httpStatus=${exec.status}|success=${exec.json.success}|hash=${exec.json.hash || "NONE"}|hashLink=${exec.json.hashLink || "NONE"}|error=${exec.json.error || "NONE"}|forkOk=${exec.json.forkSimulation?.ok ?? "UNKNOWN"}|pnlUpdated=false`);
   }
 
   console.log("C2_DECISION|decision=DO_NOTHING|reason=NO_CONFIRMED_C1_HASH_IN_THIS_CYCLE|hash=NONE|pnlUpdated=false");
   const pnl = await getJson("/api/dashboard/pnl-summary").catch((error) => ({ error: error.message }));
   console.log(`PNL_STATUS|sessionRaw=${pnl.sessionPnlRaw ?? "UNKNOWN"}|lifetimeRaw=${pnl.lifetimePnlRaw ?? "UNKNOWN"}|attribution=${pnl.pnlAttribution ?? "UNKNOWN"}|pnlUpdated=false`);
+  await flushLaneEventBatch("cycle_end");
   console.log("LIVE_CYCLE_END|status=COMPLETE|broadcasted=false_unless_hash_printed_above");
 }
 
-main().catch((error) => {
+main().then(() => {
+  process.exit(0);
+}).catch((error) => {
   console.error(`LIVE_CYCLE_FAILED|error=${error?.message || error}|broadcasted=false|pnlUpdated=false`);
   process.exit(1);
 });

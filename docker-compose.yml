@@ -55,6 +55,8 @@ services:
     container_name: apex-omega-api
     restart: unless-stopped
     depends_on:
+      redis:
+        condition: service_healthy
       anvil-fork:
         condition: service_healthy
       redis:
@@ -71,7 +73,8 @@ services:
       REQUIRE_CHAIN_ID_MATCH: ${REQUIRE_CHAIN_ID_MATCH:-true}
       RPC_REQUIRE_CHAIN_ID: ${RPC_REQUIRE_CHAIN_ID:-137}
       FORK_SIM_RPC_URL: http://anvil-fork:8545
-      REDIS_URL: redis://:${REDIS_PASSWORD:-apex_redis_secret}@redis:6379
+      REDIS_URL: redis://redis:6379
+      REDIS_ENABLED: ${REDIS_ENABLED:-true}
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval: 30s
@@ -103,3 +106,4 @@ networks:
 
 volumes:
   bor-data:
+  redis-data:
