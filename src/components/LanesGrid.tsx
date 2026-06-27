@@ -77,7 +77,7 @@ export default function LanesGrid({ lanes }: LanesGridProps) {
   }
 
   return (
-    <div className="h-28 min-h-[96px] border-t border-[#1e2025] bg-black/40 flex flex-col font-mono text-[9px] shrink-0 select-none relative z-20">
+    <div className="h-28 min-h-[96px] border-t border-[#1e2025] bg-black/40 flex flex-col font-mono text-[9px] shrink-0 select-none relative z-20 glass-specular glass-inset">
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#1e2025]/50 shrink-0">
         <span className="text-gray-500 uppercase tracking-[0.15em] font-bold text-[7.5px]">
           32-LANE PARALLEL EXECUTOR CLUSTERS
@@ -108,7 +108,7 @@ export default function LanesGrid({ lanes }: LanesGridProps) {
         {lanes.map((lane) => (
           <div
             key={lane.id}
-            className={`flex flex-col items-center justify-center border rounded-sm p-1 gap-1 transition-all duration-300 ${getCellBorderAndBg(
+            className={`flex flex-col items-center justify-center border rounded-sm p-1 gap-1 transition-all duration-300 glass-specular glass-inset-sm ${getCellBorderAndBg(
               lane.status,
             )}`}
             title={`Lane ${lane.id}: ${lane.status === "simulating" ? "SOLVING" : lane.status.toUpperCase()}${

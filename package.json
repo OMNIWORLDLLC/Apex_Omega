@@ -21,7 +21,13 @@
     "fork:calldata": "tsx scripts/fork-calldata-sim.ts",
     "cloud:readiness": "tsx scripts/cloud-readiness.ts",
     "live:cycle": "tsx scripts/live-cycle.ts",
+<<<<<<< HEAD
     "live:pools": "tsx scripts/display-live-pools.ts"
+=======
+    "perf:metrics": "tsx scripts/perf-metrics.ts",
+    "perf:metrics:snapshot": "tsx scripts/perf-metrics.ts --snapshot"
+    "live:cycle-5": "tsx scripts/live-cycle-5.ts"
+>>>>>>> dcdf83b72840313c103575853f5b3a93912bedbb
   },
   "dependencies": {
     "@google/genai": "^1.52.0",
@@ -31,6 +37,7 @@
     "dotenv": "^17.2.3",
     "ethers": "^6.17.0",
     "express": "^4.21.2",
+    "ioredis": "^5.11.1",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "msgpackr": "^2.0.4",

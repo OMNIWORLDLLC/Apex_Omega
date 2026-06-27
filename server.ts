@@ -7,7 +7,11 @@ import { ethers } from "ethers";
 import { WebSocketServer } from "ws";
 import { DeFiExecutorManager } from "./ExecutionManager.js";
 import { InvariantMath } from "./server/engine/invariants.js";
+<<<<<<< HEAD
 import { runDiscoveryCycle } from "./scripts/live-cycle.js";
+=======
+import RedisRouteGuard from "./server/engine/RedisRouteGuard.js";
+>>>>>>> dcdf83b72840313c103575853f5b3a93912bedbb
 import {
   getActiveLedgerCount,
   getActiveLedgerOpportunities,
@@ -1056,6 +1060,11 @@ async function startServer() {
 
   app.use(express.json());
 
+  // ── Redis Route Guard ────────────────────────────────────────────────────
+  // Prevents multiple PM2 workers / overlapping async cycles from racing to
+  // execute the same arb route.  No-op when REDIS_URL is not set.
+  const redisGuard = new RedisRouteGuard(process.env.REDIS_URL);
+
   // Runtime state starts empty and is populated only by live reads or actual execution results.
   const bootConfig = getRuntimeConfig();
   let liveBlockNumber = 0;
@@ -1121,6 +1130,7 @@ async function startServer() {
     verifiedAt?: number;
     creditedRaw?: bigint;
     creditedAmount?: number;
+    routeKey?: string;
     c2Seed?: {
       targetContract: string;
       flashloanSource: number;
@@ -2379,6 +2389,7 @@ async function startServer() {
         });
       }
 
+<<<<<<< HEAD
       let precisionGate: any;
       try {
         precisionGate = await elitePrecisionPreBroadcastGate({
@@ -2404,6 +2415,26 @@ async function startServer() {
           gate: "APEX_OMEGA_2_0_ELITE_PRECISION_PROFIT_GATE",
           txCreated: false,
           pnlUpdated: false,
+=======
+      // Validate that context.steps is a non-empty array before locking so the
+      // key is deterministic and cannot collapse to a generic asset-only key.
+      if (!Array.isArray(context?.steps) || context.steps.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: "INVALID_C1_PAYLOAD: context.steps must be a non-empty array.",
+          payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
+        });
+      }
+
+      // ── Redis: acquire route lock before broadcast ──────────────────────
+      const { acquired: c1LockAcquired, key: c1RouteKey } =
+        await redisGuard.acquireC1Lock(flashloanAsset, context.steps);
+      if (!c1LockAcquired) {
+        return res.status(409).json({
+          success: false,
+          error: "ROUTE_LOCK_HELD: this route is already in-flight on another worker – skipping to prevent duplicate execution.",
+          payloadKind: "FLASHLOAN_INTEGRATED_C1_PAYLOADS",
+>>>>>>> dcdf83b72840313c103575853f5b3a93912bedbb
         });
       }
 
@@ -2426,6 +2457,7 @@ async function startServer() {
             preBalance: await fetchTokenBalance(profitAsset, profitReceiver),
             submittedAt: Date.now(),
             verified: false,
+            routeKey: c1RouteKey,
             c2Seed: {
               targetContract: cfg.C2_ARB_EXECUTOR_ADDRESS || cfg.C2_TARGET || targetContract,
               flashloanSource,
@@ -2443,6 +2475,10 @@ async function startServer() {
             });
           }
         }
+      } else {
+        // Release the lock immediately on broadcast failure so the route
+        // can be retried by the same or another worker.
+        await redisGuard.releaseLock(c1RouteKey);
       } else if (redisId) {
         await releaseOpportunityLock(redisId, "C1_REJECTED", {
           error: result.error || "C1 execution rejected",
@@ -2478,6 +2514,13 @@ async function startServer() {
         });
       }
 
+      // ── Redis: deduplicate C2 settlements by c1InternalId ───────────────
+      const { acquired: c2LockAcquired, key: c2RouteKey } =
+        await redisGuard.acquireC2Lock(c1InternalId);
+      if (!c2LockAcquired) {
+        return res.status(409).json({
+          success: false,
+          error: "C2_LOCK_HELD: a C2 settlement for this c1InternalId is already in-flight on another worker.",
       const pairedC1Instance = [...c2Instances.values()].find(
         (instance) => instance.c1InternalId.toLowerCase() === String(c1InternalId).toLowerCase(),
       );
@@ -2578,9 +2621,13 @@ async function startServer() {
             preBalance: await fetchTokenBalance(profitAsset, profitReceiver),
             submittedAt: Date.now(),
             verified: false,
+            routeKey: c2RouteKey,
           });
           systemLogQueue.push({ tag: "C2", message: `HASH PRINTED: ${result.hashLink || getExplorerTxLink(result.hash)} | P&L locked pending AI/on-chain verification for ${profitReceiver}` });
         }
+      } else {
+        // Release lock on broadcast failure so retries are possible
+        await redisGuard.releaseLock(c2RouteKey);
       }
       pairedC1Instance.decisions.push(record);
       if (pairedC1Instance.decisions.filter((item) => item.decision !== "EXPIRED").length >= C2_PER_C1_LIMIT || currentBlock >= pairedC1Instance.expiresAfterBlock) {
@@ -2906,6 +2953,8 @@ async function startServer() {
         pending.verifiedAt = Date.now();
         pending.creditedRaw = 0n;
         pending.creditedAmount = 0;
+        // Release the route lock – the tx reverted, so the route is free to retry
+        if (pending.routeKey) await redisGuard.releaseLock(pending.routeKey);
         systemLogQueue.push({ tag: "SYS", message: `HASH VERIFIED FAILED/REVERTED: ${pending.hashLink} | P&L unchanged.` });
         return res.status(409).json({ success: false, hash, hashLink: pending.hashLink, payloadKind: pending.payloadKind, receiptStatus: receipt.status, pnlUpdated: false, creditedRaw: "0" });
       }
@@ -2919,6 +2968,8 @@ async function startServer() {
         pending.verifiedAt = Date.now();
         pending.creditedRaw = 0n;
         pending.creditedAmount = 0;
+        // Release the route lock – route confirmed on-chain but yielded no profit
+        if (pending.routeKey) await redisGuard.releaseLock(pending.routeKey);
         systemLogQueue.push({ tag: "SYS", message: `HASH VERIFIED: ${pending.hashLink} | No profit-asset Transfer logs to ${pending.profitReceiver}. P&L unchanged.` });
         return res.json({
           success: true,
@@ -2941,6 +2992,8 @@ async function startServer() {
       pending.verifiedAt = Date.now();
       pending.creditedRaw = creditedRaw;
       pending.creditedAmount = rawTokenAmountToNumber(creditedRaw, decimals);
+      // Route fully settled – release the lock so the route can be re-discovered next cycle
+      if (pending.routeKey) await redisGuard.releaseLock(pending.routeKey);
       systemLogQueue.push({ tag: "PNL", message: `HASH VERIFIED: ${pending.hashLink} | Credited exact on-chain profit ${creditedText} raw=${creditedRaw.toString()} to ${pending.profitReceiver}.` });
 
       res.json({
@@ -3685,6 +3738,22 @@ async function startServer() {
         });
       }
 
+      // ── Redis: prevent duplicate liquidation of the same position ────────
+      const { acquired: liqLockAcquired, key: liqRouteKey } =
+        await redisGuard.acquireLiquidationLock(
+          targetContract,
+          liquidation.user,
+          liquidation.debtAsset,
+          liquidation.collateralAsset
+        );
+      if (!liqLockAcquired) {
+        return res.status(409).json({
+          success: false,
+          error: "LIQUIDATION_LOCK_HELD: this position is already being liquidated by another worker.",
+          payloadKind: "FLASHLOAN_INTEGRATED_LIQUIDATIONS",
+        });
+      }
+
       const result = await defiExecutor.broadcastFlashloanIntegratedLiquidation({
         targetContract,
         liquidation: {
@@ -3719,9 +3788,12 @@ async function startServer() {
             preBalance: await fetchTokenBalance(profitAsset, profitReceiver),
             submittedAt: Date.now(),
             verified: false,
+            routeKey: liqRouteKey,
           });
           systemLogQueue.push({ tag: "SYS", message: `HASH PRINTED: ${result.hashLink || getExplorerTxLink(result.hash)} | P&L locked pending AI/on-chain verification for ${profitReceiver}` });
         }
+      } else {
+        await redisGuard.releaseLock(liqRouteKey);
       }
 
       res.status(result.success ? 200 : 409).json(result);
@@ -4148,6 +4220,28 @@ async function startServer() {
       clearInterval(intervalId);
     });
   });
+
+  // ── Graceful shutdown: close Redis connection cleanly ───────────────────
+  const shutdown = async (signal: string) => {
+    console.log(`[APEX_OMEGA] ${signal} received – shutting down`);
+    const shutdownTimeout = setTimeout(() => {
+      console.error("[APEX_OMEGA] Shutdown timed out – forcing exit");
+      process.exit(1);
+    }, 10_000);
+    shutdownTimeout.unref();
+    try {
+      await redisGuard.close();
+    } catch (err: any) {
+      console.warn("[APEX_OMEGA] Redis close error during shutdown:", err?.message);
+    }
+    server.close((err) => {
+      if (err) console.error("[APEX_OMEGA] HTTP server close error:", err.message);
+      clearTimeout(shutdownTimeout);
+      process.exit(err ? 1 : 0);
+    });
+  };
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.once("SIGINT", () => shutdown("SIGINT"));
 }
 
 startServer().catch((err) => {

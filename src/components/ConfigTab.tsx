@@ -90,7 +90,7 @@ export default function ConfigTab({ addLog, setConfigChanged }: ConfigTabProps) 
 
   return (
     <form onSubmit={handleSave} className="font-mono text-[10px] space-y-4">
-      <div className="bg-[#0d0e12]/80 border border-[#1e2025] rounded-sm p-4 relative flex flex-col">
+      <div className="bg-[#0d0e12]/80 border border-[#1e2025] rounded-sm p-4 relative flex flex-col glass-specular glass-inset">
         {/* Abstract futuristic corner accents */}
         <div className="absolute top-0 right-0 w-2.5 h-2.5 border-t border-r border-[#00e5ff]/40" />
         <div className="absolute bottom-0 left-0 w-2.5 h-2.5 border-b border-l border-[#00e5ff]/40" />

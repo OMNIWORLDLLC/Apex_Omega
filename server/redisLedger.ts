@@ -13,7 +13,10 @@ const LANE_BATCH_WINDOW_MS = Number(process.env.REDIS_LANE_BATCH_WINDOW_MS || 50
 const LANE_BATCH_MAX_SIZE = Number(process.env.REDIS_LANE_BATCH_MAX_SIZE || 1_000);
 const OPPORTUNITY_THRESHOLD_BPS = Number(process.env.REDIS_OPPORTUNITY_THRESHOLD_BPS || 1);
 const ENABLE_KEYSPACE_NOTIFICATIONS = process.env.REDIS_ENABLE_KEYSPACE_NOTIFICATIONS === "true";
+<<<<<<< HEAD
 const REDIS_REQUIRED_FOR_LIVE = process.env.REDIS_REQUIRED_FOR_LIVE !== "false";
+=======
+>>>>>>> dcdf83b72840313c103575853f5b3a93912bedbb
 
 type LedgerPayload = Record<string, any>;
 
@@ -33,7 +36,10 @@ let clientPromise: Promise<RedisClientType | null> | null = null;
 let lastError: string | null = null;
 let laneBuffer: LedgerPayload[] = [];
 let laneFlushTimer: NodeJS.Timeout | null = null;
+<<<<<<< HEAD
 let runtimeLiveExecutionArmed: boolean | null = null;
+=======
+>>>>>>> dcdf83b72840313c103575853f5b3a93912bedbb
 
 function redisEnabled() {
   return process.env.REDIS_ENABLED !== "false";
@@ -237,7 +243,10 @@ export function getRedisLedgerStatus() {
     connected: Boolean(clientPromise) && !lastError,
     url: redisSocketPath() ? `unix://${redisSocketPath()}` : redisUrl().replace(/\/\/.*@/, "//***@"),
     transport: redisSocketPath() ? "unix_socket" : "tcp",
+<<<<<<< HEAD
     architecture: process.env.REDIS_ARCHITECTURE || "hot_path_execution_ledger",
+=======
+>>>>>>> dcdf83b72840313c103575853f5b3a93912bedbb
     keyPrefix: KEY_PREFIX,
     streams: {
       laneEvents: laneSetKey(),

@@ -15,7 +15,7 @@ export default function SimulationConsole() {
   }, []);
 
   return (
-    <div className="flex flex-col h-full bg-[#07080a] border border-[#1e2025] rounded-sm font-mono text-[10px]">
+    <div className="flex flex-col h-full bg-[#07080a] border border-[#1e2025] rounded-sm font-mono text-[10px] glass-specular glass-inset">
       <div className="flex items-center justify-between p-2 border-b border-[#1e2025] bg-[#0d0e12]">
         <div className="flex items-center gap-2">
           <Terminal size={14} className="text-cyan-400" />

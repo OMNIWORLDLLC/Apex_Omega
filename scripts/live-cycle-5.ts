@@ -3,6 +3,11 @@
 import "dotenv/config";
 import { spawn } from "node:child_process";
 import { ethers } from "ethers";
+import ApexOmegaBootstrap, {
+  formatCycleResults,
+  CycleResults,
+  ExecutionCycle,
+} from "../server/engine/SystemBootstrap.js";
 
 const CHAIN_ID = 137n;
 const DEFAULT_CYCLE_COUNT = 5;
@@ -19,6 +24,35 @@ function intEnv(name: string, fallback: number) {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
+// Validate RPC connectivity and chain ID
+async function validateChain(): Promise<boolean> {
+  try {
+    const provider = new ethers.JsonRpcProvider(RPC_URL);
+    const network = await provider.getNetwork();
+
+    if (network.chainId !== 137n) {
+      console.error(
+        `[ERROR] Invalid chain. Expected 137 (Polygon), got ${network.chainId}`
+      );
+      return false;
+    }
+
+    const blockNumber = await provider.getBlockNumber();
+    const feeData = await provider.getFeeData();
+    const gasPrice = feeData.gasPrice ?? feeData.maxFeePerGas;
+
+    if (gasPrice === null) {
+      throw new Error("Unable to determine gas pricing from provider fee data");
+    }
+
+    console.log(`✓ Chain 137 verified`);
+    console.log(`  Block: ${blockNumber}`);
+    console.log(`  Gas Price: ${(Number(gasPrice) / 1e9).toFixed(2)} Gwei`);
+
+    return true;
+  } catch (error: any) {
+    console.error("[ERROR] Chain validation failed:", error?.message);
+    return false;
 async function getJson(path: string) {
   const response = await fetch(`${API_BASE}${path}`);
   const text = await response.text();

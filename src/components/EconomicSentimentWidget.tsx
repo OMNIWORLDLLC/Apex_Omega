@@ -152,7 +152,7 @@ export default function EconomicSentimentWidget() {
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 flex-1 min-h-0">
         {/* Left Column: AI Sentiment Graph */}
-        <div className="lg:col-span-6 flex flex-col h-full bg-[#07080a] border border-[#1e2025] rounded-sm relative">
+        <div className="lg:col-span-6 flex flex-col h-full bg-[#07080a] border border-[#1e2025] rounded-sm relative glass-specular glass-inset">
           <div className="absolute top-0 right-0 w-3 h-3 border-t border-r border-purple-500/50" />
           <div className="flex justify-between items-center p-3 border-b border-[#1e2025] bg-[#0d0e12]">
             <span className="font-bold text-white uppercase tracking-wider">
@@ -241,7 +241,7 @@ export default function EconomicSentimentWidget() {
         </div>
 
         {/* Center Column: Sentiment Gauge and API Keys Explanation */}
-        <div className="lg:col-span-3 flex flex-col h-full bg-[#07080a] border border-[#1e2025] rounded-sm">
+        <div className="lg:col-span-3 flex flex-col h-full bg-[#07080a] border border-[#1e2025] rounded-sm glass-specular glass-inset">
           <div className="p-3 border-b border-[#1e2025] bg-[#0d0e12] flex justify-between items-center">
             <span className="font-bold text-white uppercase tracking-wider">
               Net Volatility Vector
@@ -329,7 +329,7 @@ export default function EconomicSentimentWidget() {
         </div>
 
         {/* Right Column: Macro Economic Events */}
-        <div className="lg:col-span-3 flex flex-col h-full bg-[#07080a] border border-[#1e2025] rounded-sm">
+        <div className="lg:col-span-3 flex flex-col h-full bg-[#07080a] border border-[#1e2025] rounded-sm glass-specular glass-inset">
           <div className="p-3 border-b border-[#1e2025] bg-[#0d0e12] flex items-center gap-2">
             <Calendar size={12} className="text-cyan-400" />
             <span className="font-bold text-white uppercase tracking-wider">
